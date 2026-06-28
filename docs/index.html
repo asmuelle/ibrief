@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ibrief — ein selbstverbesserndes Morning Briefing</title>
+<meta name="description" content="ibrief erstellt jede Nacht ein personalisiertes Morning Briefing und verbessert sich jeden Tag selbst — lokal in Rust, mit lokalen LLMs. Anti-Blase by design." />
+<meta property="og:title" content="ibrief — selbstverbesserndes Morning Briefing" />
+<meta property="og:description" content="Lokal-first in Rust. Lernt Gewichte, Prompts und Quellen. Anti-Blase auf Mechanismus-Ebene." />
+<meta property="og:type" content="website" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --bg: oklch(16% 0.02 265);
+  --bg-raise: oklch(21% 0.025 265);
+  --bg-card: oklch(24% 0.03 265);
+  --line: oklch(34% 0.03 265);
+  --text: oklch(95% 0.01 265);
+  --muted: oklch(72% 0.02 265);
+  --faint: oklch(58% 0.02 265);
+  --accent: oklch(78% 0.16 155);
+  --accent-2: oklch(72% 0.15 280);
+  --warn: oklch(80% 0.14 70);
+
+  --display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  --text-hero: clamp(2.6rem, 1.2rem + 5.5vw, 5.5rem);
+  --text-h2: clamp(1.6rem, 1.1rem + 2vw, 2.6rem);
+  --text-h3: clamp(1.15rem, 1rem + 0.6vw, 1.4rem);
+  --text-base: clamp(1rem, 0.96rem + 0.2vw, 1.1rem);
+
+  --space-section: clamp(4rem, 3rem + 6vw, 9rem);
+  --maxw: 1080px;
+  --radius: 14px;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur: 320ms;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, oklch(24% 0.05 155 / 0.35), transparent 60%),
+    radial-gradient(1000px 500px at -10% 10%, oklch(24% 0.05 280 / 0.3), transparent 55%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--body);
+  font-size: var(--text-base);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.wrap { max-width: var(--maxw); margin-inline: auto; padding-inline: clamp(1.2rem, 5vw, 2.5rem); }
+section { padding-block: var(--space-section); border-top: 1px solid var(--line); }
+h2 { font-family: var(--display); font-size: var(--text-h2); font-weight: 700; letter-spacing: -0.02em; line-height: 1.05; margin: 0 0 0.4em; }
+h3 { font-family: var(--display); font-size: var(--text-h3); font-weight: 500; margin: 0 0 0.4em; }
+.eyebrow { font-family: var(--mono); font-size: 0.8rem; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); margin: 0 0 1rem; }
+.lead { color: var(--muted); max-width: 60ch; }
+
+/* nav */
+header.nav { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(12px); background: oklch(16% 0.02 265 / 0.7); border-bottom: 1px solid var(--line); }
+.nav .wrap { display: flex; align-items: center; justify-content: space-between; padding-block: 0.9rem; }
+.brand { font-family: var(--display); font-weight: 700; letter-spacing: -0.02em; font-size: 1.15rem; }
+.brand span { color: var(--accent); }
+.nav nav { display: flex; gap: 1.4rem; font-size: 0.9rem; }
+.nav nav a { color: var(--muted); }
+.nav nav a:hover { color: var(--text); text-decoration: none; }
+.gh { font-family: var(--mono); font-size: 0.82rem; padding: 0.4rem 0.8rem; border: 1px solid var(--line); border-radius: 8px; color: var(--text); transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease); }
+.gh:hover { border-color: var(--accent); transform: translateY(-1px); text-decoration: none; }
+@media (max-width: 720px) { .nav nav { display: none; } }
+
+/* hero */
+.hero { border-top: none; padding-top: clamp(3rem, 2rem + 6vw, 6rem); }
+.hero h1 { font-family: var(--display); font-size: var(--text-hero); font-weight: 700; line-height: 0.98; letter-spacing: -0.035em; margin: 0.3em 0 0.4em; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero .lead { font-size: clamp(1.1rem, 1rem + 0.6vw, 1.35rem); max-width: 56ch; }
+.goals { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 2rem; }
+.goals li { list-style: none; font-family: var(--mono); font-size: 0.82rem; padding: 0.45rem 0.85rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: var(--bg-raise); }
+.goals { padding: 0; }
+.cta { display: flex; gap: 0.9rem; margin-top: 2.4rem; flex-wrap: wrap; }
+.btn { font-family: var(--mono); font-size: 0.9rem; padding: 0.75rem 1.3rem; border-radius: 10px; transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+.btn-primary { background: var(--accent); color: oklch(18% 0.04 155); font-weight: 500; }
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 10px 30px oklch(78% 0.16 155 / 0.25); text-decoration: none; }
+.btn-ghost { border: 1px solid var(--line); color: var(--text); }
+.btn-ghost:hover { border-color: var(--accent); text-decoration: none; transform: translateY(-2px); }
+
+/* generic cards */
+.grid { display: grid; gap: 1.1rem; }
+.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.cols-3 { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 800px) { .cols-2, .cols-3 { grid-template-columns: 1fr; } }
+.card { background: linear-gradient(180deg, var(--bg-card), var(--bg-raise)); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.5rem; transition: transform var(--dur) var(--ease), border-color var(--dur) var(--ease); }
+.card:hover { transform: translateY(-3px); border-color: oklch(40% 0.05 155); }
+.card p { color: var(--muted); margin: 0; }
+.card .k { font-family: var(--mono); font-size: 0.78rem; color: var(--accent); letter-spacing: 0.05em; }
+
+/* axis table */
+.axes { margin-top: 2rem; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.axis { display: grid; grid-template-columns: 1.2fr 1.4fr 1.4fr; gap: 1rem; padding: 1.2rem 1.4rem; border-top: 1px solid var(--line); }
+.axis:first-child { border-top: none; background: var(--bg-raise); font-family: var(--mono); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--faint); }
+.axis strong { font-family: var(--display); font-weight: 500; }
+.axis small { color: var(--muted); }
+@media (max-width: 720px) { .axis { grid-template-columns: 1fr; gap: 0.3rem; } .axis:first-child { display: none; } .axis strong::before { content: "▸ "; color: var(--accent); } }
+
+/* loop diagram */
+.loop { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: stretch; margin-top: 2rem; }
+.loop .node { flex: 1 1 140px; background: var(--bg-card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; position: relative; }
+.loop .node .n { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); }
+.loop .node h4 { margin: 0.25rem 0 0.15rem; font-family: var(--display); font-weight: 500; font-size: 1.05rem; }
+.loop .node p { margin: 0; color: var(--faint); font-size: 0.85rem; }
+.loop .arrow { align-self: center; color: var(--faint); font-family: var(--mono); }
+.loopback { margin-top: 0.8rem; font-family: var(--mono); font-size: 0.82rem; color: var(--accent-2); }
+
+/* pipeline */
+.pipe { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.6rem; font-family: var(--mono); font-size: 0.85rem; }
+.pipe span { padding: 0.5rem 0.85rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-raise); color: var(--muted); }
+.pipe span.hot { border-color: var(--accent); color: var(--text); }
+.pipe b { color: var(--faint); align-self: center; }
+
+/* anatomy */
+.anatomy { margin-top: 2rem; display: grid; gap: 0.8rem; }
+.row { display: grid; grid-template-columns: 180px 1fr; gap: 1.2rem; padding: 1rem 1.2rem; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-raise); align-items: baseline; }
+.row .label { font-family: var(--display); font-weight: 500; }
+.row .label .pin { display: inline-block; font-family: var(--mono); font-size: 0.65rem; color: var(--warn); border: 1px solid oklch(50% 0.1 70); border-radius: 5px; padding: 0.05rem 0.35rem; margin-left: 0.4rem; vertical-align: middle; }
+.row p { margin: 0; color: var(--muted); }
+@media (max-width: 720px) { .row { grid-template-columns: 1fr; gap: 0.3rem; } }
+
+/* timeline */
+.timeline { margin-top: 2rem; display: grid; gap: 0; }
+.ms { display: grid; grid-template-columns: 90px 1fr; gap: 1.2rem; padding: 1.1rem 0; border-top: 1px solid var(--line); }
+.ms .tag { font-family: var(--mono); font-size: 0.82rem; color: var(--accent); }
+.ms .tag .done { color: var(--faint); }
+.ms h4 { margin: 0 0 0.2rem; font-family: var(--display); font-weight: 500; }
+.ms p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+
+/* code */
+pre { background: oklch(13% 0.02 265); border: 1px solid var(--line); border-radius: 12px; padding: 1.2rem 1.3rem; overflow-x: auto; font-family: var(--mono); font-size: 0.85rem; line-height: 1.7; color: var(--text); }
+pre .c { color: var(--faint); }
+pre .a { color: var(--accent); }
+code { font-family: var(--mono); font-size: 0.9em; background: var(--bg-raise); padding: 0.1rem 0.4rem; border-radius: 5px; }
+
+/* stack chips */
+.stack { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.6rem; }
+.stack span { font-family: var(--mono); font-size: 0.8rem; padding: 0.45rem 0.8rem; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
+.stack span b { color: var(--accent); font-weight: 400; }
+
+footer { border-top: 1px solid var(--line); padding-block: 3rem; color: var(--faint); font-size: 0.9rem; }
+footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <span class="brand">i<span>brief</span></span>
+    <nav>
+      <a href="#warum">Warum</a>
+      <a href="#loop">Der Loop</a>
+      <a href="#achsen">Achsen</a>
+      <a href="#anatomie">Briefing</a>
+      <a href="#meilensteine">Roadmap</a>
+      <a href="#start">Start</a>
+    </nav>
+    <a class="gh" href="https://github.com/asmuelle/ibrief">GitHub ↗</a>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Lokal-first · Rust · lokale LLMs</p>
+      <h1>Ein Morning Briefing,<br />das sich <em>jeden Tag selbst verbessert.</em></h1>
+      <p class="lead">ibrief erstellt über Nacht ein kuratiertes Briefing, das auf eine konkrete Person zugeschnitten ist — und misst dann, was wirklich nützlich war, um sich anzupassen. 5 Minuten Signal statt Stunden Rauschen. Vollständig lokal auf einem Apple-Silicon-Rechner.</p>
+      <ul class="goals">
+        <li>weiterentwickeln</li>
+        <li>am Ball bleiben</li>
+        <li>gute Entscheidungen</li>
+        <li>interessante Gespräche</li>
+      </ul>
+      <div class="cta">
+        <a class="btn btn-primary" href="#start">Loslegen</a>
+        <a class="btn btn-ghost" href="https://github.com/asmuelle/ibrief">Quellcode lesen</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="warum">
+    <div class="wrap">
+      <p class="eyebrow">Designphilosophie</p>
+      <h2>Das Gedächtnis ist das Produkt — nicht das Modell.</h2>
+      <p class="lead">ibrief folgt einer „LLM-OS"-Haltung: das LLM ist ein austauschbarer Rechenkern, der Wert liegt im persistenten, versionierten Zustand. Selbstverbesserung läuft auf der Leine — vorschlagen, gegen reales Feedback verifizieren, absichern, übernehmen, zurückrollen.</p>
+      <div class="grid cols-2" style="margin-top:2rem">
+        <article class="card">
+          <p class="k">// austauschbar</p>
+          <h3>Modell ≠ Lock-in</h3>
+          <p>Gelernt werden nur Daten-Artefakte — Gewichte, Prompts, Quellen. Nie der Anwendungscode. Die Config überlebt jeden Modellwechsel.</p>
+        </article>
+        <article class="card">
+          <p class="k">// autonomy slider</p>
+          <h3>Auf der Leine</h3>
+          <p>Jede vorgeschlagene Änderung durchläuft ein Safety Gate, bevor sie Default wird. Verifikation ist billiger als Generierung — viel vorschlagen, wenig (Geprüftes) übernehmen.</p>
+        </article>
+        <article class="card">
+          <p class="k">// anti-blase</p>
+          <h3>Engagement ist nicht das Ziel</h3>
+          <p>Ein naiver Engagement-Optimierer macht dich bequemer, aber dümmer. ibrief opfert bewusst kurzfristigen Score, um Diversität und Anti-Blase-Invarianten zu halten.</p>
+        </article>
+        <article class="card">
+          <p class="k">// gated autoresearch</p>
+          <h3>Tiefe, kontrolliert</h3>
+          <p>Mehrstufige Recherche (Karpathy-Style) ist mächtig, aber teuer und halluzinationsanfällig — daher ein budgetiertes, belegpflichtiges Modul, kein freilaufender Agent.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="loop">
+    <div class="wrap">
+      <p class="eyebrow">Der Selbstverbesserungs-Kreis</p>
+      <h2>Ausliefern → Feedback → Bewerten → Lernen → Absichern.</h2>
+      <p class="lead">Jede Nacht läuft die gleiche Schleife. Was nützlich war, verstärkt sich; was nicht, verblasst — innerhalb harter Sicherheitsgrenzen.</p>
+      <div class="loop">
+        <div class="node"><div class="n">01</div><h4>Deliver</h4><p>Briefing erzeugen &amp; pushen</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">02</div><h4>Feedback</h4><p>👍/👎 via Telegram-Buttons</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">03</div><h4>Eval</h4><p>Verhalten + Judge + Struktur</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">04</div><h4>Learn</h4><p>Gewichte · Prompts · Quellen</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">05</div><h4>Gate</h4><p>prüfen · übernehmen · rollback</p></div>
+      </div>
+      <p class="loopback">↺ Der Verhaltens-Score ist die Ground Truth; der LLM-Judge dient v.a. im Cold-Start und wird gegen reales Feedback kalibriert.</p>
+    </div>
+  </section>
+
+  <section id="achsen">
+    <div class="wrap">
+      <p class="eyebrow">Drei Achsen, jede abgesichert</p>
+      <h2>Selbstverbesserung ist kein Feature — es sind drei.</h2>
+      <div class="axes">
+        <div class="axis"><span>Achse</span><span>Hebel</span><span>Absicherung</span></div>
+        <div class="axis">
+          <div><strong>Gewichte</strong><br /><small>Quellen &amp; Themen</small></div>
+          <div><small>Multi-Armed-Bandit (Thompson / Beta-Sampling) mit Exploration-Floor [0.2, 2.0]</small></div>
+          <div><small>Safety Gate: Grenzen + Quellen-Diversität (max 50 %), versioniert, Rollback</small></div>
+        </div>
+        <div class="axis">
+          <div><strong>Prompts</strong><br /><small>z. B. TL;DR-Synthese</small></div>
+          <div><small>Optimizer-LLM erzeugt Varianten; Schatten-Test bewertet beide am selben Input</small></div>
+          <div><small>Adoption nur bei klarer Judge-Marge; Prompt-Versionierung + Experiment-Log</small></div>
+        </div>
+        <div class="axis">
+          <div><strong>Quellen</strong><br /><small>Feed-Registry</small></div>
+          <div><small>Qualitäts-Scoring aus Feedback + Selektionshäufigkeit; schwache aussortieren</small></div>
+          <div><small>Drift-Wächter (HHI): bei Verengung wird Pruning ausgesetzt — Breite vor Score</small></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <div class="wrap">
+      <p class="eyebrow">Die nächtliche Pipeline</p>
+      <h2>Vom Rohfeed zum kuratierten Briefing.</h2>
+      <div class="pipe">
+        <span>Ingest</span><b>→</b>
+        <span>Dedup</span><b>→</b>
+        <span>Enrich</span><b>→</b>
+        <span class="hot">Score (Gewichte)</span><b>→</b>
+        <span>Curate</span><b>→</b>
+        <span class="hot">TL;DR (gelernter Prompt)</span><b>→</b>
+        <span>Render</span><b>→</b>
+        <span>Persist</span><b>→</b>
+        <span>Push</span>
+      </div>
+      <p class="lead" style="margin-top:1.6rem">Das <strong>Massen-Tier</strong> (Zusammenfassen, Tagging) läuft auf einem schnellen kleinen Modell, das <strong>Synthese-Tier</strong> (Kuratierung, Judge) auf einem 70B-Klasse-Modell — beide lokal. Der gesamte Lernzyklus läuft über Nacht praktisch kostenlos; ein Frontier-Modell wird nur optional zur Judge-Kalibrierung über ein bestehendes Abo (<code>claude -p</code>) hinzugezogen.</p>
+    </div>
+  </section>
+
+  <section id="anatomie">
+    <div class="wrap">
+      <p class="eyebrow">Anatomie eines Briefings</p>
+      <h2>Drei Abschnitte mit klarer Absicht.</h2>
+      <p class="lead">Die letzten beiden sind durch Personalisierung <em>nicht</em> wegoptimierbar. Der Lern-Loop kann dich nicht in eine bequeme Blase optimieren.</p>
+      <div class="anatomy">
+        <div class="row">
+          <div class="label">Highlights</div>
+          <p>Die wichtigsten Meldungen des Tages — personalisiert über die gelernten Gewichte. Plus „Die 3 Dinge heute" als Executive Summary.</p>
+        </div>
+        <div class="row">
+          <div class="label">Gegenperspektive <span class="pin">fix</span></div>
+          <p>Ein ernsthaft dargestelltes, fair argumentiertes Gegenargument (Steelman) zu deiner eigenen Position — damit du in Gesprächen die andere Seite kennst, statt in der Blase zu argumentieren.</p>
+        </div>
+        <div class="row">
+          <div class="label">Wildcard <span class="pin">fix</span></div>
+          <p>Ein bewusst überraschender, echter Artikel außerhalb deiner üblichen Interessen — bevorzugt aus einer Quelle, die es nicht in die Hauptauswahl geschafft hat.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="meilensteine">
+    <div class="wrap">
+      <p class="eyebrow">Roadmap — vollständig implementiert</p>
+      <h2>Sechs Meilensteine, jeder eigenständig nützlich.</h2>
+      <div class="timeline">
+        <div class="ms"><div class="tag">M1 <span class="done">✓</span></div><div><h4>Statisches Briefing</h4><p>Ingest → Enrich → Curate → Render gegen lokales Ollama.</p></div></div>
+        <div class="ms"><div class="tag">M2 <span class="done">✓</span></div><div><h4>Persistenz &amp; Feedback</h4><p>SQLite (sqlx), Dedup, Briefing-Records; Telegram-Push mit 👍/👎-Buttons.</p></div></div>
+        <div class="ms"><div class="tag">M3 <span class="done">✓</span></div><div><h4>Eval Engine</h4><p>Verhaltens-Score + LLM-Judge gegen versionierte Rubrik + deterministische Strukturchecks.</p></div></div>
+        <div class="ms"><div class="tag">M4 <span class="done">✓</span></div><div><h4>Lernen: Gewichte</h4><p>Thompson-Bandit über Quellen/Themen, Safety Gate, Config-Versionierung &amp; Rollback.</p></div></div>
+        <div class="ms"><div class="tag">M5 <span class="done">✓</span></div><div><h4>Lernen: Prompts</h4><p>Optimizer-LLM + Schatten-Test; temporales A/B-Entscheidungs-Primitiv.</p></div></div>
+        <div class="ms"><div class="tag">M6 <span class="done">✓</span></div><div><h4>Quellen-Evolution + AutoResearch</h4><p>Scoring, Pruning, Drift-Wächter; gated Deep-Research-Loop mit Beleg-Verifikation.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <p class="eyebrow">Schnellstart</p>
+      <h2>Lokal in zwei Minuten.</h2>
+      <p class="lead">Voraussetzung: <a href="https://ollama.com">Ollama</a> mit einem Massen- und einem Synthese-Modell. Auf kleinerer Hardware einfach kleinere Modelle in <code>config/profile.toml</code> eintragen.</p>
+<pre><span class="c"># Modelle holen</span>
+ollama pull qwen2.5:14b      <span class="c"># Massen-Tier (Enrich)</span>
+ollama pull llama3.3:70b     <span class="c"># Synthese-Tier (TL;DR, Judge)</span>
+
+<span class="c"># Briefing erzeugen</span>
+cargo run -p ibrief-app                 <span class="c"># = brief</span>
+
+<span class="c"># Lernen &amp; Optimieren</span>
+cargo run -p ibrief-app -- <span class="a">eval</span>       <span class="c"># heutiges Briefing bewerten</span>
+cargo run -p ibrief-app -- <span class="a">learn</span>      <span class="c"># Gewichte lernen (Thompson + Gate)</span>
+cargo run -p ibrief-app -- <span class="a">optimize</span>   <span class="c"># TL;DR-Prompt im Schatten-Test verbessern</span>
+cargo run -p ibrief-app -- <span class="a">sources</span> evolve   <span class="c"># Quellen bewerten + Drift-Wächter</span>
+cargo run -p ibrief-app -- <span class="a">research</span> <span class="a">"Was ist neu bei lokalen LLMs?"</span></pre>
+
+      <p class="eyebrow" style="margin-top:3rem">Tech-Stack</p>
+      <div class="stack">
+        <span><b>Rust</b> 1.95 · Edition 2024</span>
+        <span><b>Tokio</b> async</span>
+        <span><b>Ollama</b> lokale LLMs</span>
+        <span><b>sqlx</b> + SQLite</span>
+        <span><b>feed-rs</b> Ingest</span>
+        <span><b>reqwest</b> Telegram-API</span>
+        <span><b>rand_distr</b> Thompson</span>
+        <span>12 Crates · 23 Tests</span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>ibrief — selbstverbesserndes Morning Briefing · MIT-Lizenz</span>
+    <span><a href="https://github.com/asmuelle/ibrief">github.com/asmuelle/ibrief</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

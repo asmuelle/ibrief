@@ -1,0 +1,22 @@
+# Owner-Profil und LLM-Einstellungen (Daten, kein Code).
+
+[profile]
+language = "de"
+reading_time_min = 5
+
+[llm]
+ollama_url = "http://localhost:11434"
+# Massen-Tier: schnell, für Zusammenfassen/Tagging vieler Items
+enrich_model = "qwen2.5:14b"
+# Synthese-Tier: stark, für TL;DR / Kuratierung (später auch Judge)
+synth_model = "llama3.3:70b"
+max_items_enrich = 15
+top_n = 8
+
+[store]
+path = "ibrief.db"
+
+[telegram]
+# Push + Feedback-Buttons. Token kommt aus der Env-Var IBRIEF_TELEGRAM_TOKEN (nie in Config!).
+enabled = false
+chat_id = ""

@@ -1,0 +1,14 @@
+[package]
+name = "ibrief-learn"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ibrief-core.workspace = true
+ibrief-store.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+rand.workspace = true
+rand_distr.workspace = true

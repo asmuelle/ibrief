@@ -1,0 +1,17 @@
+# Quellen-Registry (M1: simple Liste; ab M6 lernt das System diese Liste selbst).
+
+[[source]]
+id = "verge"
+url = "https://www.theverge.com/rss/index.xml"
+
+[[source]]
+id = "hn"
+url = "https://hnrss.org/frontpage"
+
+[[source]]
+id = "arstechnica"
+url = "https://feeds.arstechnica.com/arstechnica/index"
+
+[[source]]
+id = "tagesschau"
+url = "https://www.tagesschau.de/index~rss2.xml"

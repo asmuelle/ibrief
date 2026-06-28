@@ -1,0 +1,13 @@
+[package]
+name = "ibrief-pipeline"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ibrief-core.workspace = true
+ibrief-llm.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

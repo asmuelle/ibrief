@@ -1,0 +1,29 @@
+[package]
+name = "ibrief-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ibrief"
+path = "src/main.rs"
+
+[dependencies]
+ibrief-core.workspace = true
+ibrief-ingest.workspace = true
+ibrief-llm.workspace = true
+ibrief-pipeline.workspace = true
+ibrief-store.workspace = true
+ibrief-telegram.workspace = true
+ibrief-eval.workspace = true
+ibrief-learn.workspace = true
+ibrief-optimize.workspace = true
+ibrief-sources.workspace = true
+ibrief-research.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+toml.workspace = true
+serde.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

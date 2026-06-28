@@ -1,0 +1,17 @@
+[package]
+name = "ibrief-research"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ibrief-llm.workspace = true
+ibrief-store.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

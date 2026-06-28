@@ -1,0 +1,13 @@
+[package]
+name = "ibrief-ingest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ibrief-core.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+feed-rs.workspace = true
+serde.workspace = true
+tracing.workspace = true

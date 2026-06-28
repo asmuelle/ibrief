@@ -1,0 +1,10 @@
+[package]
+name = "ibrief-sources"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ibrief-store.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
