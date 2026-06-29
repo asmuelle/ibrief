@@ -7,11 +7,21 @@ reading_time_min = 5
 [llm]
 ollama_url = "http://localhost:11434"
 # Massen-Tier: schnell, für Zusammenfassen/Tagging vieler Items
-enrich_model = "qwen2.5:14b"
+enrich_model = "gemma4:26b"
 # Synthese-Tier: stark, für TL;DR / Kuratierung (später auch Judge)
-synth_model = "llama3.3:70b"
+synth_model = "gemma4:31b"
 max_items_enrich = 15
 top_n = 8
+# Quellen mit quality < diesem Wert werden nicht kuratiert (0.0 = aus). Seed-Qualität ist 0.5;
+# `ibrief sources evolve` senkt schwache Quellen darunter. Lenient gewählt, damit neue Quellen passieren.
+min_source_quality = 0.3
+
+# A/B-Bakeoff (`ibrief bench`): Kandidaten für den Synthese-Tier (Reasoning/Wildcard).
+# Das aktive synth_model ist immer als Baseline dabei. Leer lassen = nur Baseline.
+# Tags vor dem Lauf verifizieren: `ollama pull <tag>` / `ollama list`.
+synth_candidates = [ "gemma4:31b"]
+# Kandidaten für den Massen-/Enrich-Tier (Doku + spätere Enrich-Bakeoffs).
+enrich_candidates = ["gemma4:26b"]
 
 [store]
 path = "ibrief.db"

@@ -1,10 +1,18 @@
 //! ibrief M3 — Briefing (M1) + Persistenz/Feedback (M2) + Eval Engine (M3).
 //!
 //! Befehle:
-//!   ibrief [brief]            Ingest → Dedup → Enrich → Score(Gewichte) → Curate → Render → Persist → (Push)
+//!   ibrief [brief] [--force]  Ingest → Dedup → Score → Enrich(Top-Kandidaten) → Curate → Render → Persist → (Push)
+//!                             `--force`: Cross-Day-Dedup überspringen, heutiges Briefing neu aufbauen
 //!   ibrief feedback           Telegram-Feedback-Loop: Button-Klicks → Store
+//!   ibrief feedback list [datum]              Items des Briefings mit Position anzeigen
+//!   ibrief feedback add <pos> <art> [datum]   Feedback ohne Telegram (art: up|down|more|less|open)
 //!   ibrief eval [datum] [calibrate]
 //!                             Briefing bewerten (Verhalten + Judge + Struktur) → evals-Tabelle
+//!   ibrief bench [enrich] [datum] [calibrate]
+//!                             Modelle gegeneinander testen (A/B-Bakeoff) → Ranking.
+//!                             Default: Synth-Tier (TL;DR/Gegenperspektive).
+//!                             `enrich`: Massen-Tier (Ein-Satz-Zusammenfassungen je Item).
+//!   ibrief bench list         Bakeoff-Historie anzeigen (Modell-Vergleiche über Tage)
 //!   ibrief learn              Gewichte lernen (Thompson + Safety Gate) → neue Config-Version
 //!   ibrief config list        Config-Historie anzeigen (aktive markiert)
 //!   ibrief config rollback <version>   Auf frühere Config-Version zurücksetzen
@@ -18,20 +26,23 @@
 //! Voraussetzungen: Ollama (brief/eval), IBRIEF_TELEGRAM_TOKEN (feedback/push).
 
 use anyhow::{Context, Result};
-use ibrief_core::BriefingSection;
-use ibrief_eval::{EvalWeights, RUBRIC_VERSION};
+use ibrief_core::{BriefingSection, FeedbackKind};
+use ibrief_eval::{EvalWeights, RUBRIC_VERSION, bakeoff::Candidate};
 use ibrief_ingest::Source;
 use ibrief_llm::{ClaudeCodeModel, LanguageModel, OllamaClient};
-use ibrief_store::{EvalRow, Store};
+use ibrief_store::{BenchRunRow, EvalRow, Store};
 use ibrief_telegram::Telegram;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONFIG_VERSION: &str = "m3-dev";
 const TOKEN_ENV: &str = "IBRIEF_TELEGRAM_TOKEN";
 const CONFIG_DIR_ENV: &str = "IBRIEF_CONFIG_DIR";
+/// Max. Anteil einer einzelnen Quelle im Briefing (muss zum Diversitäts-Check in ibrief_eval passen).
+const MAX_SOURCE_SHARE: f64 = 0.6;
 
 #[derive(Deserialize)]
 struct ProfileFile {
@@ -55,6 +66,16 @@ struct LlmConfig {
     synth_model: String,
     max_items_enrich: usize,
     top_n: usize,
+    /// Quellen mit `quality` unter diesem Wert werden nicht kuratiert (0.0 = Filter aus).
+    /// Greift mit `sources evolve` zusammen, das die Qualität pflegt.
+    #[serde(default)]
+    min_source_quality: f64,
+    /// A/B-Kandidaten für den Synthese-Tier (`ibrief bench`).
+    #[serde(default)]
+    synth_candidates: Vec<String>,
+    /// A/B-Kandidaten für den Enrich-Tier (`ibrief bench enrich`).
+    #[serde(default)]
+    enrich_candidates: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,9 +109,10 @@ async fn main() -> Result<()> {
     let profile: ProfileFile = load_toml(cfg_dir.join("profile.toml"))?;
 
     match command.as_str() {
-        "brief" => run_brief(cfg_dir, &profile).await,
-        "feedback" => run_feedback(&profile).await,
+        "brief" => run_brief(cfg_dir, &profile, &rest).await,
+        "feedback" => run_feedback(&profile, &rest).await,
         "eval" => run_eval(&profile, &rest).await,
+        "bench" => run_bench(&profile, &rest).await,
         "learn" => run_learn(&profile).await,
         "config" => run_config(&profile, &rest).await,
         "optimize" => run_optimize(&profile, &rest).await,
@@ -98,17 +120,20 @@ async fn main() -> Result<()> {
         "sources" => run_sources(cfg_dir, &profile, &rest).await,
         "research" => run_research(&profile, &rest).await,
         other => anyhow::bail!(
-            "unbekannter Befehl '{other}' (erwartet: brief | feedback | eval | learn | config | optimize | experiment | sources | research)"
+            "unbekannter Befehl '{other}' (erwartet: brief | feedback | eval | bench | learn | config | optimize | experiment | sources | research)"
         ),
     }
 }
 
-async fn run_brief(cfg_dir: &Path, profile: &ProfileFile) -> Result<()> {
+async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    let force = rest.iter().any(|a| a == "--force" || a == "force");
     let store = Store::open(&profile.store.path).await?;
 
     // Quellen-Registry: aus sources.toml seeden (idempotent), dann aktive Quellen laden.
     seed_sources(cfg_dir, &store).await?;
     let active = store.active_sources().await?;
+    // Qualität je Quelle merken (für den Kurations-Floor weiter unten).
+    let quality: HashMap<String, f64> = active.iter().map(|s| (s.id.clone(), s.quality)).collect();
     let sources: Vec<Source> = active
         .into_iter()
         .map(|s| Source {
@@ -117,33 +142,78 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile) -> Result<()> {
         })
         .collect();
 
-    // INGEST + DEDUP
+    // INGEST + DEDUP (Intra-Batch gegen Feed-Doppel, dann Cross-Day gegen den Store)
     tracing::info!(sources = sources.len(), "INGEST");
     let fetched = ibrief_ingest::fetch_all(&sources).await;
-    let fresh = store.filter_unseen(fetched).await?;
-    tracing::info!(fresh = fresh.len(), "neue Items nach Dedup");
+    let deduped = ibrief_pipeline::dedup_batch(fetched);
+    let fresh = if force {
+        tracing::warn!("--force: Cross-Day-Dedup übersprungen, Briefing wird neu aufgebaut");
+        deduped
+    } else {
+        store.filter_unseen(deduped).await?
+    };
+
+    // Qualitäts-Floor: Items aus Quellen unter dem Schwellwert nicht kuratieren.
+    // Unbekannte Quellen (sollte nicht vorkommen) passieren mit 1.0.
+    let min_q = profile.llm.min_source_quality;
+    let fresh: Vec<_> = if min_q > 0.0 {
+        let before = fresh.len();
+        let kept: Vec<_> = fresh
+            .into_iter()
+            .filter(|it| quality.get(&it.source_id).copied().unwrap_or(1.0) >= min_q)
+            .collect();
+        if kept.len() < before {
+            tracing::info!(
+                dropped = before - kept.len(),
+                min_quality = min_q,
+                "Quellen-Qualitätsfilter angewandt"
+            );
+        }
+        kept
+    } else {
+        fresh
+    };
+
+    tracing::info!(fresh = fresh.len(), "Items nach Dedup/Filter");
     if fresh.is_empty() {
-        tracing::warn!("keine neuen Items — nichts zu briefen");
+        tracing::warn!(
+            "keine neuen Items — nichts zu briefen (Tipp: `brief --force` baut heute neu)"
+        );
         return Ok(());
     }
 
-    // ENRICH (Massen-Tier) + Persist
+    // SCORE zuerst, dann nur die Kandidaten anreichern, die auch kuratiert werden.
+    // (Sonst werden die ersten N in Fetch-Reihenfolge enriched, aber die aktuellsten gezeigt.)
+    let cfg = ibrief_learn::load_active(&store).await?;
+    if !force {
+        // Neue Items als „gesehen" markieren (roh), damit sie nicht erneut auftauchen.
+        for it in &fresh {
+            store.upsert_item(it).await?;
+        }
+    }
+    let pre_ranked = ibrief_pipeline::rank(fresh, &cfg);
+    let candidate_n = profile.llm.max_items_enrich.max(profile.llm.top_n);
+    let candidates: Vec<_> = pre_ranked.into_iter().take(candidate_n).collect();
+
+    // ENRICH (Massen-Tier) nur über die Kandidaten + Persist (jetzt mit Summary/Topics)
     let enrich_model = OllamaClient::new(
         profile.llm.ollama_url.clone(),
         profile.llm.enrich_model.clone(),
     );
-    tracing::info!(model = enrich_model.label(), "ENRICH");
-    let enriched =
-        ibrief_pipeline::enrich(fresh, &enrich_model, profile.llm.max_items_enrich).await;
+    let n_cand = candidates.len();
+    tracing::info!(model = enrich_model.label(), candidates = n_cand, "ENRICH");
+    let enriched = ibrief_pipeline::enrich(candidates, &enrich_model, n_cand).await;
     for it in &enriched {
         store.upsert_item(it).await?;
     }
 
-    // SCORE (gelernte Gewichte) + CURATE
-    let cfg = ibrief_learn::load_active(&store).await?;
+    // RE-RANK (jetzt mit Topics) → Wildcard + quellen-diverse Kuration
     let ranked = ibrief_pipeline::rank(enriched, &cfg);
     let wildcard = ibrief_pipeline::pick_wildcard(&ranked, profile.llm.top_n);
-    let mut briefing = ibrief_pipeline::curate(ranked, profile.llm.top_n);
+    let max_per_source = ((profile.llm.top_n as f64) * MAX_SOURCE_SHARE)
+        .floor()
+        .max(1.0) as usize;
+    let mut briefing = ibrief_pipeline::curate(ranked, profile.llm.top_n, max_per_source);
     briefing.date = today();
 
     // TL;DR (Synthese-Tier, mit aktivem/gelerntem Prompt)
@@ -208,10 +278,63 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile) -> Result<()> {
     Ok(())
 }
 
-async fn run_feedback(profile: &ProfileFile) -> Result<()> {
+async fn run_feedback(profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    match rest.first().map(String::as_str) {
+        Some("list") => feedback_list(profile, &rest[1..]).await,
+        Some("add") => feedback_add(profile, &rest[1..]).await,
+        // Ohne Subbefehl: Telegram-Loop (braucht Token + chat_id).
+        _ => {
+            let store = Store::open(&profile.store.path).await?;
+            let tg = telegram_from(profile)?;
+            tg.run_feedback_loop(&store).await
+        }
+    }
+}
+
+/// Zeigt die Items des Briefings mit ihrer Position (Eingabehilfe für `feedback add`).
+async fn feedback_list(profile: &ProfileFile, args: &[String]) -> Result<()> {
+    let date = args.first().cloned().unwrap_or_else(today);
     let store = Store::open(&profile.store.path).await?;
-    let tg = telegram_from(profile)?;
-    tg.run_feedback_loop(&store).await
+    let items = store.briefing_item_list(&date).await?;
+    if items.is_empty() {
+        anyhow::bail!("kein Briefing für {date} im Store");
+    }
+    println!("Briefing {date} — Items (Position für `feedback add`):");
+    for it in items {
+        println!(
+            "  [{:>2}] {:<12} {:<14} {}",
+            it.position, it.section_id, it.source_id, it.title
+        );
+    }
+    println!("\nFeedback geben: ibrief feedback add <position> <up|down|more|less|open> [datum]");
+    Ok(())
+}
+
+/// Schreibt ein Feedback-Ereignis für die Item-Position eines Briefings (ohne Telegram).
+async fn feedback_add(profile: &ProfileFile, args: &[String]) -> Result<()> {
+    let pos: i64 = args
+        .first()
+        .context("Position fehlt: ibrief feedback add <position> <art> [datum]")?
+        .parse()
+        .context("Position muss eine Zahl sein")?;
+    let kind_str = args
+        .get(1)
+        .context("Art fehlt (up|down|more|less|open)")?
+        .as_str();
+    let kind = FeedbackKind::parse(kind_str)
+        .with_context(|| format!("ungültige Art '{kind_str}' (up|down|more|less|open)"))?;
+    let date = args.get(2).cloned().unwrap_or_else(today);
+
+    let store = Store::open(&profile.store.path).await?;
+    let Some(item_id) = store.item_at(&date, pos).await? else {
+        anyhow::bail!("keine Position {pos} im Briefing {date} (siehe `feedback list {date}`)");
+    };
+    store.record_feedback(&date, &item_id, kind).await?;
+    println!(
+        "✓ {} für Position {pos} gespeichert ({item_id})",
+        kind.as_str()
+    );
+    Ok(())
 }
 
 async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {
@@ -271,6 +394,243 @@ async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {
         println!("  · {n}");
     }
     Ok(())
+}
+
+async fn run_bench(profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    if rest.iter().any(|a| a == "list") {
+        return run_bench_list(profile).await;
+    }
+
+    let calibrate = rest.iter().any(|a| a == "calibrate");
+    let enrich_mode = rest.iter().any(|a| a == "enrich");
+    // Datum = erstes Argument, das kein Schlüsselwort ist.
+    let keywords = ["calibrate", "enrich", "synth", "list"];
+    let date = rest
+        .iter()
+        .find(|a| !keywords.contains(&a.as_str()))
+        .cloned()
+        .unwrap_or_else(today);
+
+    let store = Store::open(&profile.store.path).await?;
+    let Some(briefing) = store.load_briefing(&date).await? else {
+        anyhow::bail!("kein Briefing für {date} im Store (erst `ibrief brief` für diesen Tag)");
+    };
+
+    // Judge: lokal (aktives synth_model) oder Abo-Kalibrierung (claude -p). Für alle Kandidaten gleich.
+    let judge: Box<dyn LanguageModel> = if calibrate {
+        tracing::info!("Bakeoff-Judge via Abo-Kalibrierung (claude -p)");
+        Box::new(ClaudeCodeModel::new(Some("opus".to_string())))
+    } else {
+        Box::new(OllamaClient::new(
+            profile.llm.ollama_url.clone(),
+            profile.llm.synth_model.clone(),
+        ))
+    };
+
+    if enrich_mode {
+        run_bench_enrich(profile, &store, &briefing, judge.as_ref(), calibrate, &date).await
+    } else {
+        run_bench_synth(profile, &store, &briefing, judge.as_ref(), calibrate, &date).await
+    }
+}
+
+/// Baut Kandidaten-Clients: das aktive `baseline`-Modell ist immer dabei.
+fn bench_candidates<'a>(
+    ollama_url: &str,
+    baseline: &str,
+    configured: &[String],
+    models: &'a mut Vec<OllamaClient>,
+) -> Vec<Candidate<'a>> {
+    let mut names: Vec<String> = configured.to_vec();
+    if !names.iter().any(|n| n == baseline) {
+        names.insert(0, baseline.to_string());
+    }
+    *models = names
+        .iter()
+        .map(|m| OllamaClient::new(ollama_url.to_string(), m.clone()))
+        .collect();
+    names
+        .into_iter()
+        .zip(models.iter())
+        .map(|(name, model)| Candidate { name, model })
+        .collect()
+}
+
+async fn run_bench_synth(
+    profile: &ProfileFile,
+    store: &Store,
+    briefing: &ibrief_core::Briefing,
+    judge: &dyn LanguageModel,
+    calibrate: bool,
+    date: &str,
+) -> Result<()> {
+    let feedback = store.feedback_counts(date).await?;
+    let mut models = Vec::new();
+    let candidates = bench_candidates(
+        &profile.llm.ollama_url,
+        &profile.llm.synth_model,
+        &profile.llm.synth_candidates,
+        &mut models,
+    );
+
+    // Feste TL;DR-Vorlage (aktiver, gelernter Prompt) — nur das Modell variiert.
+    let tldr_prompt = ibrief_optimize::active_tldr(store).await?;
+    let weights = EvalWeights::default();
+
+    let outcome = ibrief_eval::bakeoff::run(
+        briefing,
+        &feedback,
+        profile.profile.reading_time_min,
+        &weights,
+        judge,
+        &tldr_prompt.template,
+        &candidates,
+    )
+    .await;
+
+    let judge_mode = if calibrate { "abo" } else { "lokal" };
+    println!(
+        "Synth-Bakeoff {date} (judge={judge_mode}, prompt={}, baseline={}):",
+        tldr_prompt.version, profile.llm.synth_model
+    );
+    for (i, e) in outcome.entries.iter().enumerate() {
+        let star = baseline_marker(&e.name, &profile.llm.synth_model);
+        println!(
+            "  {}. {:<18} total={:.2}  [judge={:.2} struct={:.2}]  {} ms{star}",
+            i + 1,
+            e.name,
+            e.eval.total,
+            e.eval.judge,
+            e.eval.structure,
+            e.elapsed_ms,
+        );
+        store
+            .save_bench_run(&BenchRunRow {
+                date: date.to_string(),
+                tier: "synth".into(),
+                model: e.name.clone(),
+                judge_mode: judge_mode.into(),
+                total: e.eval.total,
+                scores: vec![
+                    ("judge".into(), e.eval.judge),
+                    ("struct".into(), e.eval.structure),
+                    ("behavior".into(), e.eval.behavior),
+                ],
+                items_scored: 0,
+                elapsed_ms: e.elapsed_ms as i64,
+                is_winner: i == 0,
+            })
+            .await?;
+    }
+    if let Some(w) = outcome.winner() {
+        println!(
+            "→ Gewinner: {} (total {:.2}) · in Historie gespeichert",
+            w.name, w.eval.total
+        );
+    }
+    Ok(())
+}
+
+async fn run_bench_enrich(
+    profile: &ProfileFile,
+    store: &Store,
+    briefing: &ibrief_core::Briefing,
+    judge: &dyn LanguageModel,
+    calibrate: bool,
+    date: &str,
+) -> Result<()> {
+    let mut models = Vec::new();
+    let candidates = bench_candidates(
+        &profile.llm.ollama_url,
+        &profile.llm.enrich_model,
+        &profile.llm.enrich_candidates,
+        &mut models,
+    );
+
+    let outcome = ibrief_eval::bakeoff::run_enrich(
+        briefing,
+        judge,
+        profile.llm.max_items_enrich,
+        &candidates,
+    )
+    .await;
+
+    let judge_mode = if calibrate { "abo" } else { "lokal" };
+    println!(
+        "Enrich-Bakeoff {date} (judge={judge_mode}, baseline={}):",
+        profile.llm.enrich_model
+    );
+    for (i, e) in outcome.entries.iter().enumerate() {
+        let star = baseline_marker(&e.name, &profile.llm.enrich_model);
+        println!(
+            "  {}. {:<18} total={:.2}  [treue={:.2} prägnanz={:.2} tags={:.2}]  {} Items  {} ms{star}",
+            i + 1,
+            e.name,
+            e.total,
+            e.faithfulness,
+            e.concision,
+            e.tags,
+            e.items_scored,
+            e.elapsed_ms,
+        );
+        store
+            .save_bench_run(&BenchRunRow {
+                date: date.to_string(),
+                tier: "enrich".into(),
+                model: e.name.clone(),
+                judge_mode: judge_mode.into(),
+                total: e.total,
+                scores: vec![
+                    ("treue".into(), e.faithfulness),
+                    ("prägnanz".into(), e.concision),
+                    ("tags".into(), e.tags),
+                ],
+                items_scored: e.items_scored as i64,
+                elapsed_ms: e.elapsed_ms as i64,
+                is_winner: i == 0,
+            })
+            .await?;
+    }
+    if let Some(w) = outcome.winner() {
+        println!(
+            "→ Gewinner: {} (total {:.2}) · in Historie gespeichert",
+            w.name, w.total
+        );
+    }
+    Ok(())
+}
+
+/// Zeigt die Bakeoff-Historie (`ibrief bench list`) — neueste Läufe zuerst.
+async fn run_bench_list(profile: &ProfileFile) -> Result<()> {
+    let store = Store::open(&profile.store.path).await?;
+    let runs = store.recent_bench_runs(40).await?;
+    if runs.is_empty() {
+        println!("noch keine Bakeoff-Läufe (erst `ibrief bench` oder `ibrief bench enrich`)");
+        return Ok(());
+    }
+    for r in runs {
+        let star = if r.is_winner { "★" } else { " " };
+        let subs: Vec<String> = r
+            .scores
+            .iter()
+            .map(|(k, v)| format!("{k}={v:.2}"))
+            .collect();
+        println!(
+            "{star} {} {:<7} {:<18} total={:.2}  [{}]  {} ms  (judge {})",
+            r.date,
+            r.tier,
+            r.model,
+            r.total,
+            subs.join(" "),
+            r.elapsed_ms,
+            r.judge_mode,
+        );
+    }
+    Ok(())
+}
+
+fn baseline_marker(name: &str, baseline: &str) -> &'static str {
+    if name == baseline { " (baseline)" } else { "" }
 }
 
 async fn run_learn(profile: &ProfileFile) -> Result<()> {

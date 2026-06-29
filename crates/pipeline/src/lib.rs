@@ -7,7 +7,7 @@ use anyhow::Result;
 use ibrief_core::{Briefing, BriefingSection, Config, ContentItem};
 use ibrief_llm::{Completion, LanguageModel};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const ENRICH_SYSTEM: &str =
     "Du bist ein präziser Redaktions-Assistent. Antworte ausschließlich mit JSON.";
@@ -69,6 +69,17 @@ fn extract_json(s: &str) -> String {
     }
 }
 
+/// DEDUP (innerhalb eines Laufs): behält je `id` (= URL) nur das erste Vorkommen.
+/// `filter_unseen` dedupliziert nur gegen frühere Tage — Feeds liefern aber auch
+/// im selben Batch Doppel (z.B. dieselbe Meldung mehrfach), die hier herausfallen.
+pub fn dedup_batch(items: Vec<ContentItem>) -> Vec<ContentItem> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|it| seen.insert(it.id.clone()))
+        .collect()
+}
+
 /// SCORE (§ Pipeline / M4): Items nach `recency × source_weight × topic_weight` ordnen.
 /// Neutrale Config (alle Gewichte 1.0) ⇒ reine Aktualitäts-Reihenfolge.
 pub fn rank(mut items: Vec<ContentItem>, cfg: &Config) -> Vec<ContentItem> {
@@ -94,9 +105,37 @@ pub fn rank(mut items: Vec<ContentItem>, cfg: &Config) -> Vec<ContentItem> {
     scored.into_iter().map(|(_, it)| it).collect()
 }
 
-/// CURATE: Top-N der bereits gerankten Items in eine Sektion legen.
-pub fn curate(items: Vec<ContentItem>, top_n: usize) -> Briefing {
-    let picked = items.into_iter().take(top_n).collect();
+/// CURATE: Top-N der bereits gerankten Items in eine Sektion legen — mit Quellen-Limit
+/// gegen Monokultur. `max_per_source` begrenzt, wie viele Items eine einzelne Quelle
+/// stellen darf. Bleiben danach Plätze frei (zu wenig Vielfalt vorhanden), werden sie
+/// in Rangfolge mit den besten verbleibenden Items aufgefüllt, statt das Briefing zu kürzen.
+pub fn curate(items: Vec<ContentItem>, top_n: usize, max_per_source: usize) -> Briefing {
+    let cap = max_per_source.max(1);
+    let mut per_source: HashMap<String, usize> = HashMap::new();
+    let mut picked: Vec<ContentItem> = Vec::with_capacity(top_n);
+    let mut overflow: Vec<ContentItem> = Vec::new();
+
+    for it in items {
+        if picked.len() >= top_n {
+            break;
+        }
+        let count = per_source.entry(it.source_id.clone()).or_default();
+        if *count < cap {
+            *count += 1;
+            picked.push(it);
+        } else {
+            overflow.push(it);
+        }
+    }
+
+    // Restplätze auffüllen, falls die Vielfalt nicht reichte (Rangfolge bleibt erhalten).
+    for it in overflow {
+        if picked.len() >= top_n {
+            break;
+        }
+        picked.push(it);
+    }
+
     Briefing {
         date: String::new(), // wird vom Aufrufer gesetzt
         tldr: Vec::new(),
@@ -268,5 +307,46 @@ mod tests {
     fn wildcard_none_without_leftover() {
         let ranked = vec![item("1", "a"), item("2", "b")];
         assert!(pick_wildcard(&ranked, 2).is_none());
+    }
+
+    #[test]
+    fn dedup_batch_removes_same_id_keeps_order() {
+        let items = vec![item("1", "a"), item("1", "a"), item("2", "b")];
+        let out = dedup_batch(items);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "1");
+        assert_eq!(out[1].id, "2");
+    }
+
+    #[test]
+    fn curate_caps_per_source_for_diversity() {
+        // 5 Items aus "a", 2 aus "b"; top_n=4, cap=2 → genau 2a + 2b statt 4a.
+        let items = vec![
+            item("1", "a"),
+            item("2", "a"),
+            item("3", "a"),
+            item("4", "a"),
+            item("5", "a"),
+            item("6", "b"),
+            item("7", "b"),
+        ];
+        let b = curate(items, 4, 2);
+        let picked = &b.sections[0].items;
+        assert_eq!(picked.len(), 4);
+        assert_eq!(picked.iter().filter(|i| i.source_id == "a").count(), 2);
+        assert_eq!(picked.iter().filter(|i| i.source_id == "b").count(), 2);
+    }
+
+    #[test]
+    fn curate_fills_overflow_when_not_diverse() {
+        // Nur eine Quelle, cap=2, top_n=4 → Overflow füllt auf 4 auf, statt zu kürzen.
+        let items = vec![
+            item("1", "a"),
+            item("2", "a"),
+            item("3", "a"),
+            item("4", "a"),
+        ];
+        let b = curate(items, 4, 2);
+        assert_eq!(b.sections[0].items.len(), 4);
     }
 }

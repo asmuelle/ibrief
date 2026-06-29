@@ -634,11 +634,14 @@ name = "ibrief-eval"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ibrief-core",
  "ibrief-llm",
+ "ibrief-pipeline",
  "ibrief-store",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
