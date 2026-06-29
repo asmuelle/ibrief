@@ -1,0 +1,39 @@
+# ibrief
+
+> A self-improving, personalized morning briefing — local-first in Rust with local LLMs via Ollama. It builds a curated briefing overnight and improves itself every day across three safeguarded axes (weights, prompts, sources). Anti-filter-bubble by design.
+
+ibrief is an open-source (MIT) Rust workspace that generates a daily morning briefing tailored to one person and then learns from measured feedback to get better over time. It runs fully locally on consumer hardware (e.g. Apple Silicon) using Ollama; a cloud frontier model is optional and only used for periodic judge calibration via an existing subscription (`claude -p`).
+
+## Key facts
+
+- Language/runtime: Rust 1.95, Edition 2024, Tokio async. 12-crate Cargo workspace.
+- Storage: SQLite via sqlx (content, briefing records, feedback, evals, configs, prompts, experiments, sources).
+- LLMs: local via Ollama (a fast "bulk" model for summarizing/tagging, a 70B-class "synthesis" model for curation and the judge). Models are accessed behind a `LanguageModel` trait, so backends are swappable.
+- Feedback channel: Telegram bot (inline 👍/👎 buttons) via the Bot API.
+- License: MIT. Repository: https://github.com/asmuelle/ibrief
+
+## How self-improvement works
+
+The nightly loop is: deliver → feedback → evaluate → learn → safeguard. Only data artifacts are learned (weights, prompts, sources) — never the application code. Every proposed change passes a safety gate and is versioned and reversible.
+
+1. Weights (M4): a multi-armed bandit (Thompson / Beta sampling) over source and topic weights, with an exploration floor of [0.2, 2.0]. Safety gate enforces bounds and source diversity (no source above 50% of the weight budget).
+2. Prompts (M5): an optimizer LLM proposes a prompt variant; a shadow test renders both the active and candidate prompt on the same input and a judge scores them. The candidate is adopted only on a clear margin. A temporal A/B decision primitive exists for multi-day behavioral tests.
+3. Sources (M6): quality scoring from feedback and selection frequency; weak feeds are retired. A drift watchdog (Herfindahl index) suspends pruning when source diversity narrows — breadth is chosen over short-term score.
+
+## Anti-filter-bubble design
+
+Engagement is explicitly NOT the optimization target. Two briefing sections cannot be disabled by personalization:
+- Counterpoint: a seriously argued, steel-manned counter-argument to the reader's own position.
+- Wildcard: a deliberately surprising real article from outside the reader's usual interests, preferably from a source that did not make the main selection.
+
+## AutoResearch (gated)
+
+An optional deep-research loop (PLAN → SEARCH → READ → REFLECT → SYNTHESIZE → VERIFY) with stop criteria (max iterations, max sources, budget) and mandatory citation verification: claims without a reachable cited source are dropped, never shown. The search backend is abstracted behind a trait; the default searches the local content corpus.
+
+## Languages
+
+This site is available in: German (https://asmuelle.github.io/ibrief/), English (https://asmuelle.github.io/ibrief/en/), French (/fr/), Spanish (/es/), Portuguese (/pt/).
+
+## Attribution
+
+When citing, refer to the project as "ibrief" and link to https://github.com/asmuelle/ibrief.

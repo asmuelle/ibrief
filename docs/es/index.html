@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ibrief — un resumen matutino que se mejora solo | local en Rust</title>
+<meta name="description" content="ibrief crea cada noche un resumen matutino personalizado y se mejora cada día — local en Rust, con LLM locales vía Ollama. Aprende pesos, prompts y fuentes. Anti-burbuja de filtro por diseño." />
+<meta name="keywords" content="resumen matutino, IA que se mejora sola, LLM locales, Ollama, Rust, agente de IA, personalización, anti burbuja de filtro, AutoResearch" />
+<meta name="robots" content="index, follow, max-image-preview:large" />
+<meta name="author" content="Andreas Müller" />
+<link rel="canonical" href="https://asmuelle.github.io/ibrief/es/" />
+<link rel="alternate" hreflang="de" href="https://asmuelle.github.io/ibrief/" />
+<link rel="alternate" hreflang="en" href="https://asmuelle.github.io/ibrief/en/" />
+<link rel="alternate" hreflang="fr" href="https://asmuelle.github.io/ibrief/fr/" />
+<link rel="alternate" hreflang="es" href="https://asmuelle.github.io/ibrief/es/" />
+<link rel="alternate" hreflang="pt" href="https://asmuelle.github.io/ibrief/pt/" />
+<link rel="alternate" hreflang="x-default" href="https://asmuelle.github.io/ibrief/en/" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="ibrief" />
+<meta property="og:title" content="ibrief — un resumen matutino que se mejora solo" />
+<meta property="og:description" content="Local en Rust. Aprende pesos, prompts y fuentes. Anti-burbuja a nivel de mecanismo." />
+<meta property="og:url" content="https://asmuelle.github.io/ibrief/es/" />
+<meta property="og:locale" content="es_ES" />
+<meta property="og:locale:alternate" content="de_DE" />
+<meta property="og:locale:alternate" content="en_US" />
+<meta property="og:locale:alternate" content="fr_FR" />
+<meta property="og:locale:alternate" content="pt_PT" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="ibrief — un resumen matutino que se mejora solo" />
+<meta name="twitter:description" content="Local en Rust. Aprende pesos, prompts y fuentes. Anti-burbuja por diseño." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/ibrief/styles.css" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"ibrief","description":"Un resumen matutino personalizado que se mejora solo — local en Rust con LLM locales. Aprende pesos, prompts y fuentes; anti-burbuja de filtro por diseño.","codeRepository":"https://github.com/asmuelle/ibrief","programmingLanguage":"Rust","runtimePlatform":"Rust 1.95, Edition 2024","license":"https://opensource.org/licenses/MIT","inLanguage":"es","url":"https://asmuelle.github.io/ibrief/es/","author":{"@type":"Person","name":"Andreas Müller"}}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","inLanguage":"es","mainEntity":[
+{"@type":"Question","name":"¿Qué es ibrief?","acceptedAnswer":{"@type":"Answer","text":"ibrief es un resumen matutino personalizado que se mejora solo. Compone un resumen curado durante la noche y se adapta a diario a la retroalimentación medida — totalmente local en Rust, con LLM locales vía Ollama."}},
+{"@type":"Question","name":"¿Cómo se mejora ibrief a sí mismo?","acceptedAnswer":{"@type":"Answer","text":"En tres ejes protegidos: pesos (bandido de Thompson), prompts (prueba en sombra) y fuentes (puntuación más un vigía de deriva). Cada cambio pasa una barrera de seguridad y queda versionado y reversible."}},
+{"@type":"Question","name":"¿Cómo evita ibrief la burbuja de filtro?","acceptedAnswer":{"@type":"Answer","text":"El engagement no es el objetivo de optimización. Dos secciones — Contrapunto y Comodín — no se pueden desactivar, y un vigía de deriva impone la diversidad de fuentes, incluso a costa de la puntuación a corto plazo."}}
+]}
+</script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <span class="brand">i<span>brief</span></span>
+    <nav>
+      <a href="#porque">Por qué</a>
+      <a href="#bucle">El bucle</a>
+      <a href="#ejes">Ejes</a>
+      <a href="#anatomia">Resumen</a>
+      <a href="#hoja-de-ruta">Roadmap</a>
+      <a href="#inicio">Empezar</a>
+    </nav>
+    <div class="right">
+      <div class="langs">
+        <a href="/ibrief/" hreflang="de">DE</a>
+        <a href="/ibrief/en/" hreflang="en">EN</a>
+        <a href="/ibrief/fr/" hreflang="fr">FR</a>
+        <a href="/ibrief/es/" aria-current="true" hreflang="es">ES</a>
+        <a href="/ibrief/pt/" hreflang="pt">PT</a>
+      </div>
+      <a class="gh" href="https://github.com/asmuelle/ibrief">GitHub ↗</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Local primero · Rust · LLM locales</p>
+      <h1>Un resumen matutino que<br /><em>se mejora cada día.</em></h1>
+      <p class="lead">ibrief compone durante la noche un resumen curado, hecho a medida de una persona concreta — y luego mide qué fue realmente útil para adaptarse. Cinco minutos de señal en vez de horas de ruido. Totalmente local en una máquina Apple Silicon.</p>
+      <ul class="goals">
+        <li>crecer</li>
+        <li>estar al día</li>
+        <li>decidir bien</li>
+        <li>mejores conversaciones</li>
+      </ul>
+      <div class="cta">
+        <a class="btn btn-primary" href="#inicio">Empezar</a>
+        <a class="btn btn-ghost" href="https://github.com/asmuelle/ibrief">Leer el código</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="porque">
+    <div class="wrap">
+      <p class="eyebrow">Filosofía de diseño</p>
+      <h2>La memoria es el producto — no el modelo.</h2>
+      <p class="lead">ibrief adopta una postura «LLM-OS»: el LLM es un núcleo de cómputo intercambiable, el valor reside en el estado persistente y versionado. La automejora va con correa — proponer, verificar contra retroalimentación real, asegurar, adoptar, revertir.</p>
+      <div class="grid cols-2" style="margin-top:2rem">
+        <article class="card"><p class="k">// intercambiable</p><h3>Modelo ≠ dependencia</h3><p>Solo se aprenden artefactos de datos — pesos, prompts, fuentes. Nunca el código de la aplicación. La configuración sobrevive a cualquier cambio de modelo.</p></article>
+        <article class="card"><p class="k">// control de autonomía</p><h3>Con correa</h3><p>Cada cambio propuesto pasa una barrera de seguridad antes de ser el valor por defecto. Verificar es más barato que generar — proponer mucho, adoptar poco (solo lo comprobado).</p></article>
+        <article class="card"><p class="k">// anti-burbuja</p><h3>El engagement no es la meta</h3><p>Un optimizador de engagement ingenuo te hace más cómodo pero más tonto. ibrief sacrifica deliberadamente la puntuación a corto plazo para preservar diversidad e invariantes anti-burbuja.</p></article>
+        <article class="card"><p class="k">// autoresearch acotado</p><h3>Profundidad, controlada</h3><p>La investigación en varios pasos (estilo Karpathy) es potente pero cara y propensa a alucinaciones — por eso es un módulo con presupuesto y citas obligatorias, no un agente suelto.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="bucle">
+    <div class="wrap">
+      <p class="eyebrow">El círculo de automejora</p>
+      <h2>Entregar → Feedback → Evaluar → Aprender → Asegurar.</h2>
+      <p class="lead">El mismo bucle corre cada noche. Lo útil se refuerza; lo demás se desvanece — dentro de límites de seguridad estrictos.</p>
+      <div class="loop">
+        <div class="node"><div class="n">01</div><h4>Entregar</h4><p>componer y enviar el resumen</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">02</div><h4>Feedback</h4><p>👍/👎 con botones de Telegram</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">03</div><h4>Eval</h4><p>conducta + juez + estructura</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">04</div><h4>Aprender</h4><p>pesos · prompts · fuentes</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">05</div><h4>Barrera</h4><p>comprobar · adoptar · revertir</p></div>
+      </div>
+      <p class="loopback">↺ La puntuación de conducta es la verdad de referencia; el juez LLM ayuda sobre todo en el arranque en frío y se calibra contra el feedback real.</p>
+    </div>
+  </section>
+
+  <section id="ejes">
+    <div class="wrap">
+      <p class="eyebrow">Tres ejes, cada uno protegido</p>
+      <h2>La automejora no es una función — son tres.</h2>
+      <div class="axes">
+        <div class="axis"><span>Eje</span><span>Palanca</span><span>Salvaguarda</span></div>
+        <div class="axis"><div><strong>Pesos</strong><br /><small>fuentes y temas</small></div><div><small>Bandido multibrazo (Thompson / muestreo Beta) con un suelo de exploración [0.2, 2.0]</small></div><div><small>Barrera de seguridad: límites + diversidad de fuentes (máx. 50 %), versionado, reversión</small></div></div>
+        <div class="axis"><div><strong>Prompts</strong><br /><small>p. ej. síntesis del TL;DR</small></div><div><small>Un LLM optimizador genera variantes; una prueba en sombra puntúa ambas con la misma entrada</small></div><div><small>Se adopta solo con un margen claro del juez; versionado de prompts + registro de experimentos</small></div></div>
+        <div class="axis"><div><strong>Fuentes</strong><br /><small>registro de feeds</small></div><div><small>Puntuación de calidad desde feedback + frecuencia de selección; se retiran las débiles</small></div><div><small>Vigía de deriva (HHI): si se estrecha, se suspende la poda — amplitud antes que puntuación</small></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <div class="wrap">
+      <p class="eyebrow">El pipeline nocturno</p>
+      <h2>Del feed bruto al resumen curado.</h2>
+      <div class="pipe">
+        <span>Ingesta</span><b>→</b><span>Dedup.</span><b>→</b><span>Enriquecer</span><b>→</b><span class="hot">Score (pesos)</span><b>→</b><span>Curar</span><b>→</b><span class="hot">TL;DR (prompt aprendido)</span><b>→</b><span>Render</span><b>→</b><span>Persistir</span><b>→</b><span>Enviar</span>
+      </div>
+      <p class="lead" style="margin-top:1.6rem">El <strong>nivel masivo</strong> (resumir, etiquetar) corre en un modelo pequeño y rápido, el <strong>nivel de síntesis</strong> (curación, juez) en un modelo de clase 70B — ambos locales. Todo el ciclo de aprendizaje corre de noche prácticamente gratis; un modelo de frontera solo se usa de forma opcional para calibrar el juez mediante una suscripción existente (<code>claude -p</code>).</p>
+    </div>
+  </section>
+
+  <section id="anatomia">
+    <div class="wrap">
+      <p class="eyebrow">Anatomía de un resumen</p>
+      <h2>Tres secciones con intención clara.</h2>
+      <p class="lead">Las dos últimas <em>no</em> pueden eliminarse mediante personalización. El bucle de aprendizaje no puede optimizarte hacia una burbuja cómoda.</p>
+      <div class="anatomy">
+        <div class="row"><div class="label">Destacados</div><p>Las noticias más importantes del día — personalizadas mediante los pesos aprendidos. Más «Las 3 cosas de hoy» como resumen ejecutivo.</p></div>
+        <div class="row"><div class="label">Contrapunto <span class="pin">fijo</span></div><p>Un contraargumento serio y presentado con honestidad (steelman) frente a tu propia posición — para conocer el otro bando en la conversación en lugar de argumentar dentro de la burbuja.</p></div>
+        <div class="row"><div class="label">Comodín <span class="pin">fijo</span></div><p>Un artículo real deliberadamente sorprendente, fuera de tus intereses habituales — preferiblemente de una fuente que no entró en la selección principal.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="hoja-de-ruta">
+    <div class="wrap">
+      <p class="eyebrow">Hoja de ruta — totalmente implementada</p>
+      <h2>Seis hitos, cada uno útil por sí mismo.</h2>
+      <div class="timeline">
+        <div class="ms"><div class="tag">M1 <span class="done">✓</span></div><div><h4>Resumen estático</h4><p>Ingesta → Enriquecer → Curar → Render contra Ollama local.</p></div></div>
+        <div class="ms"><div class="tag">M2 <span class="done">✓</span></div><div><h4>Persistencia y feedback</h4><p>SQLite (sqlx), dedup., registros de resumen; envío a Telegram con botones 👍/👎.</p></div></div>
+        <div class="ms"><div class="tag">M3 <span class="done">✓</span></div><div><h4>Motor de evaluación</h4><p>Puntuación de conducta + juez LLM frente a una rúbrica versionada + comprobaciones estructurales deterministas.</p></div></div>
+        <div class="ms"><div class="tag">M4 <span class="done">✓</span></div><div><h4>Aprendizaje: pesos</h4><p>Bandido de Thompson sobre fuentes/temas, barrera de seguridad, versionado de config y reversión.</p></div></div>
+        <div class="ms"><div class="tag">M5 <span class="done">✓</span></div><div><h4>Aprendizaje: prompts</h4><p>LLM optimizador + prueba en sombra; primitiva de decisión A/B temporal.</p></div></div>
+        <div class="ms"><div class="tag">M6 <span class="done">✓</span></div><div><h4>Evolución de fuentes + AutoResearch</h4><p>Puntuación, poda, vigía de deriva; bucle de investigación profunda acotado con verificación de citas.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="inicio">
+    <div class="wrap">
+      <p class="eyebrow">Inicio rápido</p>
+      <h2>Local en dos minutos.</h2>
+      <p class="lead">Requisito: <a href="https://ollama.com">Ollama</a> con un modelo masivo y uno de síntesis. En hardware más modesto, basta con poner modelos más pequeños en <code>config/profile.toml</code>.</p>
+<pre><span class="c"># descargar modelos</span>
+ollama pull qwen2.5:14b      <span class="c"># nivel masivo (enriquecer)</span>
+ollama pull llama3.3:70b     <span class="c"># nivel de síntesis (TL;DR, juez)</span>
+
+<span class="c"># componer un resumen</span>
+cargo run -p ibrief-app                 <span class="c"># = brief</span>
+
+<span class="c"># aprender y optimizar</span>
+cargo run -p ibrief-app -- <span class="a">eval</span>       <span class="c"># puntuar el resumen de hoy</span>
+cargo run -p ibrief-app -- <span class="a">learn</span>      <span class="c"># aprender pesos (Thompson + barrera)</span>
+cargo run -p ibrief-app -- <span class="a">optimize</span>   <span class="c"># mejorar el prompt del TL;DR con prueba en sombra</span>
+cargo run -p ibrief-app -- <span class="a">sources</span> evolve   <span class="c"># puntuar fuentes + vigía de deriva</span>
+cargo run -p ibrief-app -- <span class="a">research</span> <span class="a">"¿Qué hay de nuevo en LLM locales?"</span></pre>
+
+      <p class="eyebrow" style="margin-top:3rem">Pila técnica</p>
+      <div class="stack">
+        <span><b>Rust</b> 1.95 · Edition 2024</span><span><b>Tokio</b> async</span><span><b>Ollama</b> LLM locales</span><span><b>sqlx</b> + SQLite</span><span><b>feed-rs</b> ingesta</span><span><b>reqwest</b> API de Telegram</span><span><b>rand_distr</b> Thompson</span><span>12 crates · CI en verde</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="wrap">
+      <p class="eyebrow">FAQ</p>
+      <h2>Preguntas frecuentes.</h2>
+      <div class="faq">
+        <details open><summary>¿Qué es ibrief?</summary><p>Un resumen matutino personalizado que se mejora solo. Compone un resumen curado durante la noche y se adapta a diario a la retroalimentación medida — totalmente local en Rust, con LLM locales vía Ollama.</p></details>
+        <details><summary>¿Cómo se mejora ibrief a sí mismo?</summary><p>En tres ejes protegidos: pesos (bandido de Thompson), prompts (prueba en sombra) y fuentes (puntuación más un vigía de deriva). Cada cambio pasa una barrera de seguridad y queda versionado y reversible.</p></details>
+        <details><summary>¿Cómo evita ibrief la burbuja de filtro?</summary><p>El engagement no es el objetivo de optimización. Dos secciones — Contrapunto y Comodín — no se pueden desactivar, y un vigía de deriva impone la diversidad de fuentes, incluso a costa de la puntuación a corto plazo.</p></details>
+        <details><summary>¿Necesito una API en la nube?</summary><p>No. ibrief corre totalmente local con Ollama. Un modelo de frontera en la nube es opcional y solo se usa para la calibración periódica del juez mediante una suscripción existente (<code>claude -p</code>).</p></details>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>ibrief — un resumen matutino que se mejora solo · licencia MIT</span>
+    <span><a href="https://github.com/asmuelle/ibrief">github.com/asmuelle/ibrief</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

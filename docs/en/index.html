@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ibrief — a self-improving morning briefing | local-first in Rust</title>
+<meta name="description" content="ibrief builds a personalized morning briefing every night and improves itself every day — local-first in Rust with local LLMs via Ollama. It learns weights, prompts and sources. Anti-filter-bubble by design." />
+<meta name="keywords" content="morning briefing, self-improving AI, local LLMs, Ollama, Rust, AI agent, personalization, anti filter bubble, AutoResearch" />
+<meta name="robots" content="index, follow, max-image-preview:large" />
+<meta name="author" content="Andreas Müller" />
+<link rel="canonical" href="https://asmuelle.github.io/ibrief/en/" />
+<link rel="alternate" hreflang="de" href="https://asmuelle.github.io/ibrief/" />
+<link rel="alternate" hreflang="en" href="https://asmuelle.github.io/ibrief/en/" />
+<link rel="alternate" hreflang="fr" href="https://asmuelle.github.io/ibrief/fr/" />
+<link rel="alternate" hreflang="es" href="https://asmuelle.github.io/ibrief/es/" />
+<link rel="alternate" hreflang="pt" href="https://asmuelle.github.io/ibrief/pt/" />
+<link rel="alternate" hreflang="x-default" href="https://asmuelle.github.io/ibrief/en/" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="ibrief" />
+<meta property="og:title" content="ibrief — a self-improving morning briefing" />
+<meta property="og:description" content="Local-first in Rust. Learns weights, prompts and sources. Anti-bubble at the mechanism level." />
+<meta property="og:url" content="https://asmuelle.github.io/ibrief/en/" />
+<meta property="og:locale" content="en_US" />
+<meta property="og:locale:alternate" content="de_DE" />
+<meta property="og:locale:alternate" content="fr_FR" />
+<meta property="og:locale:alternate" content="es_ES" />
+<meta property="og:locale:alternate" content="pt_PT" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="ibrief — a self-improving morning briefing" />
+<meta name="twitter:description" content="Local-first in Rust. Learns weights, prompts and sources. Anti-bubble by design." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/ibrief/styles.css" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"ibrief","description":"A self-improving, personalized morning briefing — local-first in Rust with local LLMs. It learns weights, prompts and sources; anti-filter-bubble by design.","codeRepository":"https://github.com/asmuelle/ibrief","programmingLanguage":"Rust","runtimePlatform":"Rust 1.95, Edition 2024","license":"https://opensource.org/licenses/MIT","inLanguage":"en","url":"https://asmuelle.github.io/ibrief/en/","author":{"@type":"Person","name":"Andreas Müller"}}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","inLanguage":"en","mainEntity":[
+{"@type":"Question","name":"What is ibrief?","acceptedAnswer":{"@type":"Answer","text":"ibrief is a self-improving, personalized morning briefing. It builds a curated briefing overnight and adapts daily to measured feedback — fully local in Rust, using local LLMs via Ollama."}},
+{"@type":"Question","name":"How does ibrief improve itself?","acceptedAnswer":{"@type":"Answer","text":"Across three safeguarded axes: weights (Thompson bandit), prompts (shadow test) and sources (scoring plus a drift watchdog). Every change passes a safety gate and is versioned and reversible."}},
+{"@type":"Question","name":"How does ibrief avoid a filter bubble?","acceptedAnswer":{"@type":"Answer","text":"Engagement is not the optimization target. Two sections — Counterpoint and Wildcard — cannot be disabled, and a drift watchdog enforces source diversity even at the cost of the short-term score."}}
+]}
+</script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <span class="brand">i<span>brief</span></span>
+    <nav>
+      <a href="#why">Why</a>
+      <a href="#loop">The loop</a>
+      <a href="#axes">Axes</a>
+      <a href="#anatomy">Briefing</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#start">Start</a>
+    </nav>
+    <div class="right">
+      <div class="langs">
+        <a href="/ibrief/" hreflang="de">DE</a>
+        <a href="/ibrief/en/" aria-current="true" hreflang="en">EN</a>
+        <a href="/ibrief/fr/" hreflang="fr">FR</a>
+        <a href="/ibrief/es/" hreflang="es">ES</a>
+        <a href="/ibrief/pt/" hreflang="pt">PT</a>
+      </div>
+      <a class="gh" href="https://github.com/asmuelle/ibrief">GitHub ↗</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Local-first · Rust · local LLMs</p>
+      <h1>A morning briefing that<br /><em>improves itself every day.</em></h1>
+      <p class="lead">ibrief builds a curated briefing overnight, tailored to one specific person — then measures what was actually useful in order to adapt. Five minutes of signal instead of hours of noise. Fully local on an Apple Silicon machine.</p>
+      <ul class="goals">
+        <li>grow</li>
+        <li>stay current</li>
+        <li>decide well</li>
+        <li>better conversations</li>
+      </ul>
+      <div class="cta">
+        <a class="btn btn-primary" href="#start">Get started</a>
+        <a class="btn btn-ghost" href="https://github.com/asmuelle/ibrief">Read the source</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="why">
+    <div class="wrap">
+      <p class="eyebrow">Design philosophy</p>
+      <h2>The memory is the product — not the model.</h2>
+      <p class="lead">ibrief follows an "LLM-OS" stance: the LLM is a swappable compute core, the value lives in persistent, versioned state. Self-improvement stays on a leash — propose, verify against real feedback, safeguard, adopt, roll back.</p>
+      <div class="grid cols-2" style="margin-top:2rem">
+        <article class="card"><p class="k">// swappable</p><h3>Model ≠ lock-in</h3><p>Only data artifacts are learned — weights, prompts, sources. Never the application code. The config survives any model swap.</p></article>
+        <article class="card"><p class="k">// autonomy slider</p><h3>On a leash</h3><p>Every proposed change passes a safety gate before becoming the default. Verification is cheaper than generation — propose a lot, adopt little (only what's checked).</p></article>
+        <article class="card"><p class="k">// anti-bubble</p><h3>Engagement isn't the goal</h3><p>A naive engagement optimizer makes you more comfortable but dumber. ibrief deliberately sacrifices short-term score to preserve diversity and anti-bubble invariants.</p></article>
+        <article class="card"><p class="k">// gated autoresearch</p><h3>Depth, controlled</h3><p>Multi-step research (Karpathy-style) is powerful but expensive and hallucination-prone — so it is a budgeted, citation-required module, not a free-running agent.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="loop">
+    <div class="wrap">
+      <p class="eyebrow">The self-improvement circle</p>
+      <h2>Deliver → Feedback → Evaluate → Learn → Safeguard.</h2>
+      <p class="lead">The same loop runs every night. What was useful gets reinforced; what wasn't fades — within hard safety bounds.</p>
+      <div class="loop">
+        <div class="node"><div class="n">01</div><h4>Deliver</h4><p>build &amp; push the briefing</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">02</div><h4>Feedback</h4><p>👍/👎 via Telegram buttons</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">03</div><h4>Eval</h4><p>behavior + judge + structure</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">04</div><h4>Learn</h4><p>weights · prompts · sources</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">05</div><h4>Gate</h4><p>check · adopt · rollback</p></div>
+      </div>
+      <p class="loopback">↺ The behavioral score is ground truth; the LLM judge mainly helps in cold-start and is calibrated against real feedback.</p>
+    </div>
+  </section>
+
+  <section id="axes">
+    <div class="wrap">
+      <p class="eyebrow">Three axes, each safeguarded</p>
+      <h2>Self-improvement isn't one feature — it's three.</h2>
+      <div class="axes">
+        <div class="axis"><span>Axis</span><span>Lever</span><span>Safeguard</span></div>
+        <div class="axis"><div><strong>Weights</strong><br /><small>sources &amp; topics</small></div><div><small>Multi-armed bandit (Thompson / Beta sampling) with an exploration floor [0.2, 2.0]</small></div><div><small>Safety gate: bounds + source diversity (max 50%), versioned, rollback</small></div></div>
+        <div class="axis"><div><strong>Prompts</strong><br /><small>e.g. TL;DR synthesis</small></div><div><small>An optimizer LLM generates variants; a shadow test scores both on the same input</small></div><div><small>Adopted only on a clear judge margin; prompt versioning + experiment log</small></div></div>
+        <div class="axis"><div><strong>Sources</strong><br /><small>feed registry</small></div><div><small>Quality scoring from feedback + selection frequency; weak ones retired</small></div><div><small>Drift watchdog (HHI): on narrowing, pruning is suspended — breadth over score</small></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <div class="wrap">
+      <p class="eyebrow">The nightly pipeline</p>
+      <h2>From raw feed to curated briefing.</h2>
+      <div class="pipe">
+        <span>Ingest</span><b>→</b><span>Dedup</span><b>→</b><span>Enrich</span><b>→</b><span class="hot">Score (weights)</span><b>→</b><span>Curate</span><b>→</b><span class="hot">TL;DR (learned prompt)</span><b>→</b><span>Render</span><b>→</b><span>Persist</span><b>→</b><span>Push</span>
+      </div>
+      <p class="lead" style="margin-top:1.6rem">The <strong>bulk tier</strong> (summarizing, tagging) runs on a fast small model, the <strong>synthesis tier</strong> (curation, judge) on a 70B-class model — both local. The entire learning cycle runs overnight essentially for free; a frontier model is pulled in only optionally for judge calibration through an existing subscription (<code>claude -p</code>).</p>
+    </div>
+  </section>
+
+  <section id="anatomy">
+    <div class="wrap">
+      <p class="eyebrow">Anatomy of a briefing</p>
+      <h2>Three sections with clear intent.</h2>
+      <p class="lead">The last two <em>cannot</em> be optimized away by personalization. The learning loop cannot optimize you into a comfortable bubble.</p>
+      <div class="anatomy">
+        <div class="row"><div class="label">Highlights</div><p>The most important stories of the day — personalized through the learned weights. Plus "The 3 things today" as an executive summary.</p></div>
+        <div class="row"><div class="label">Counterpoint <span class="pin">fixed</span></div><p>A seriously argued, steel-manned counter-argument to your own position — so you know the other side in conversation instead of arguing inside the bubble.</p></div>
+        <div class="row"><div class="label">Wildcard <span class="pin">fixed</span></div><p>A deliberately surprising, real article outside your usual interests — preferably from a source that didn't make the main selection.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="roadmap">
+    <div class="wrap">
+      <p class="eyebrow">Roadmap — fully implemented</p>
+      <h2>Six milestones, each useful on its own.</h2>
+      <div class="timeline">
+        <div class="ms"><div class="tag">M1 <span class="done">✓</span></div><div><h4>Static briefing</h4><p>Ingest → Enrich → Curate → Render against local Ollama.</p></div></div>
+        <div class="ms"><div class="tag">M2 <span class="done">✓</span></div><div><h4>Persistence &amp; feedback</h4><p>SQLite (sqlx), dedup, briefing records; Telegram push with 👍/👎 buttons.</p></div></div>
+        <div class="ms"><div class="tag">M3 <span class="done">✓</span></div><div><h4>Eval engine</h4><p>Behavioral score + LLM judge against a versioned rubric + deterministic structural checks.</p></div></div>
+        <div class="ms"><div class="tag">M4 <span class="done">✓</span></div><div><h4>Learning: weights</h4><p>Thompson bandit over sources/topics, safety gate, config versioning &amp; rollback.</p></div></div>
+        <div class="ms"><div class="tag">M5 <span class="done">✓</span></div><div><h4>Learning: prompts</h4><p>Optimizer LLM + shadow test; a temporal A/B decision primitive.</p></div></div>
+        <div class="ms"><div class="tag">M6 <span class="done">✓</span></div><div><h4>Source evolution + AutoResearch</h4><p>Scoring, pruning, drift watchdog; gated deep-research loop with citation verification.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <p class="eyebrow">Quick start</p>
+      <h2>Local in two minutes.</h2>
+      <p class="lead">Requirement: <a href="https://ollama.com">Ollama</a> with one bulk and one synthesis model. On smaller hardware just put smaller models in <code>config/profile.toml</code>.</p>
+<pre><span class="c"># pull models</span>
+ollama pull qwen2.5:14b      <span class="c"># bulk tier (enrich)</span>
+ollama pull llama3.3:70b     <span class="c"># synthesis tier (TL;DR, judge)</span>
+
+<span class="c"># build a briefing</span>
+cargo run -p ibrief-app                 <span class="c"># = brief</span>
+
+<span class="c"># learn &amp; optimize</span>
+cargo run -p ibrief-app -- <span class="a">eval</span>       <span class="c"># score today's briefing</span>
+cargo run -p ibrief-app -- <span class="a">learn</span>      <span class="c"># learn weights (Thompson + gate)</span>
+cargo run -p ibrief-app -- <span class="a">optimize</span>   <span class="c"># improve the TL;DR prompt via shadow test</span>
+cargo run -p ibrief-app -- <span class="a">sources</span> evolve   <span class="c"># score sources + drift watchdog</span>
+cargo run -p ibrief-app -- <span class="a">research</span> <span class="a">"What's new in local LLMs?"</span></pre>
+
+      <p class="eyebrow" style="margin-top:3rem">Tech stack</p>
+      <div class="stack">
+        <span><b>Rust</b> 1.95 · Edition 2024</span><span><b>Tokio</b> async</span><span><b>Ollama</b> local LLMs</span><span><b>sqlx</b> + SQLite</span><span><b>feed-rs</b> ingest</span><span><b>reqwest</b> Telegram API</span><span><b>rand_distr</b> Thompson</span><span>12 crates · CI green</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="wrap">
+      <p class="eyebrow">FAQ</p>
+      <h2>Frequently asked.</h2>
+      <div class="faq">
+        <details open><summary>What is ibrief?</summary><p>A self-improving, personalized morning briefing. It builds a curated briefing overnight and adapts daily to measured feedback — fully local in Rust, using local LLMs via Ollama.</p></details>
+        <details><summary>How does ibrief improve itself?</summary><p>Across three safeguarded axes: weights (Thompson bandit), prompts (shadow test) and sources (scoring plus a drift watchdog). Every change passes a safety gate and is versioned and reversible.</p></details>
+        <details><summary>How does ibrief avoid a filter bubble?</summary><p>Engagement is not the optimization target. Two sections — Counterpoint and Wildcard — cannot be disabled, and a drift watchdog enforces source diversity even at the cost of the short-term score.</p></details>
+        <details><summary>Do I need a cloud API?</summary><p>No. ibrief runs fully local with Ollama. A cloud frontier model is optional and only used for periodic judge calibration through an existing subscription (<code>claude -p</code>).</p></details>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>ibrief — a self-improving morning briefing · MIT license</span>
+    <span><a href="https://github.com/asmuelle/ibrief">github.com/asmuelle/ibrief</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

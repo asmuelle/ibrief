@@ -21,7 +21,7 @@ min_source_quality = 0.3
 # Tags vor dem Lauf verifizieren: `ollama pull <tag>` / `ollama list`.
 synth_candidates = [ "gemma4:31b"]
 # Kandidaten für den Massen-/Enrich-Tier (Doku + spätere Enrich-Bakeoffs).
-enrich_candidates = ["gemma4:26b"]
+enrich_candidates = ["gemma4:26b", "qwen3:30b-a3b"]
 
 [store]
 path = "ibrief.db"

@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ibrief — un briefing matinal qui s'améliore tout seul | local en Rust</title>
+<meta name="description" content="ibrief crée chaque nuit un briefing matinal personnalisé et s'améliore chaque jour — local en Rust, avec des LLM locaux via Ollama. Il apprend les pondérations, les prompts et les sources. Anti-bulle de filtre par conception." />
+<meta name="keywords" content="briefing matinal, IA auto-améliorante, LLM locaux, Ollama, Rust, agent IA, personnalisation, anti bulle de filtre, AutoResearch" />
+<meta name="robots" content="index, follow, max-image-preview:large" />
+<meta name="author" content="Andreas Müller" />
+<link rel="canonical" href="https://asmuelle.github.io/ibrief/fr/" />
+<link rel="alternate" hreflang="de" href="https://asmuelle.github.io/ibrief/" />
+<link rel="alternate" hreflang="en" href="https://asmuelle.github.io/ibrief/en/" />
+<link rel="alternate" hreflang="fr" href="https://asmuelle.github.io/ibrief/fr/" />
+<link rel="alternate" hreflang="es" href="https://asmuelle.github.io/ibrief/es/" />
+<link rel="alternate" hreflang="pt" href="https://asmuelle.github.io/ibrief/pt/" />
+<link rel="alternate" hreflang="x-default" href="https://asmuelle.github.io/ibrief/en/" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="ibrief" />
+<meta property="og:title" content="ibrief — un briefing matinal qui s'améliore tout seul" />
+<meta property="og:description" content="Local en Rust. Apprend pondérations, prompts et sources. Anti-bulle au niveau du mécanisme." />
+<meta property="og:url" content="https://asmuelle.github.io/ibrief/fr/" />
+<meta property="og:locale" content="fr_FR" />
+<meta property="og:locale:alternate" content="de_DE" />
+<meta property="og:locale:alternate" content="en_US" />
+<meta property="og:locale:alternate" content="es_ES" />
+<meta property="og:locale:alternate" content="pt_PT" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="ibrief — un briefing matinal qui s'améliore tout seul" />
+<meta name="twitter:description" content="Local en Rust. Apprend pondérations, prompts et sources. Anti-bulle par conception." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/ibrief/styles.css" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareSourceCode","name":"ibrief","description":"Un briefing matinal personnalisé et auto-améliorant — local en Rust avec des LLM locaux. Il apprend les pondérations, les prompts et les sources ; anti-bulle de filtre par conception.","codeRepository":"https://github.com/asmuelle/ibrief","programmingLanguage":"Rust","runtimePlatform":"Rust 1.95, Edition 2024","license":"https://opensource.org/licenses/MIT","inLanguage":"fr","url":"https://asmuelle.github.io/ibrief/fr/","author":{"@type":"Person","name":"Andreas Müller"}}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","inLanguage":"fr","mainEntity":[
+{"@type":"Question","name":"Qu'est-ce qu'ibrief ?","acceptedAnswer":{"@type":"Answer","text":"ibrief est un briefing matinal personnalisé et auto-améliorant. Il compose un briefing organisé pendant la nuit et s'adapte chaque jour aux retours mesurés — entièrement local en Rust, avec des LLM locaux via Ollama."}},
+{"@type":"Question","name":"Comment ibrief s'améliore-t-il tout seul ?","acceptedAnswer":{"@type":"Answer","text":"Sur trois axes sécurisés : pondérations (bandit de Thompson), prompts (test fantôme) et sources (scoring plus une vigie de dérive). Chaque changement passe une barrière de sécurité, est versionné et réversible."}},
+{"@type":"Question","name":"Comment ibrief évite-t-il la bulle de filtre ?","acceptedAnswer":{"@type":"Answer","text":"L'engagement n'est pas l'objectif d'optimisation. Deux sections — Contrepoint et Joker — ne peuvent pas être désactivées, et une vigie de dérive impose la diversité des sources, même au prix du score à court terme."}}
+]}
+</script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <span class="brand">i<span>brief</span></span>
+    <nav>
+      <a href="#pourquoi">Pourquoi</a>
+      <a href="#boucle">La boucle</a>
+      <a href="#axes">Axes</a>
+      <a href="#anatomie">Briefing</a>
+      <a href="#feuille-de-route">Roadmap</a>
+      <a href="#demarrage">Démarrer</a>
+    </nav>
+    <div class="right">
+      <div class="langs">
+        <a href="/ibrief/" hreflang="de">DE</a>
+        <a href="/ibrief/en/" hreflang="en">EN</a>
+        <a href="/ibrief/fr/" aria-current="true" hreflang="fr">FR</a>
+        <a href="/ibrief/es/" hreflang="es">ES</a>
+        <a href="/ibrief/pt/" hreflang="pt">PT</a>
+      </div>
+      <a class="gh" href="https://github.com/asmuelle/ibrief">GitHub ↗</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Local d'abord · Rust · LLM locaux</p>
+      <h1>Un briefing matinal qui<br /><em>s'améliore chaque jour.</em></h1>
+      <p class="lead">ibrief compose pendant la nuit un briefing organisé, taillé pour une personne précise — puis mesure ce qui a vraiment été utile pour s'adapter. Cinq minutes de signal au lieu d'heures de bruit. Entièrement local sur une machine Apple Silicon.</p>
+      <ul class="goals">
+        <li>progresser</li>
+        <li>rester à jour</li>
+        <li>bien décider</li>
+        <li>conversations riches</li>
+      </ul>
+      <div class="cta">
+        <a class="btn btn-primary" href="#demarrage">Commencer</a>
+        <a class="btn btn-ghost" href="https://github.com/asmuelle/ibrief">Lire le code source</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="pourquoi">
+    <div class="wrap">
+      <p class="eyebrow">Philosophie de conception</p>
+      <h2>La mémoire est le produit — pas le modèle.</h2>
+      <p class="lead">ibrief adopte une posture « LLM-OS » : le LLM est un cœur de calcul interchangeable, la valeur réside dans l'état persistant et versionné. L'auto-amélioration reste tenue en laisse — proposer, vérifier face aux retours réels, sécuriser, adopter, revenir en arrière.</p>
+      <div class="grid cols-2" style="margin-top:2rem">
+        <article class="card"><p class="k">// interchangeable</p><h3>Modèle ≠ verrouillage</h3><p>On n'apprend que des artefacts de données — pondérations, prompts, sources. Jamais le code applicatif. La config survit à tout changement de modèle.</p></article>
+        <article class="card"><p class="k">// curseur d'autonomie</p><h3>Tenue en laisse</h3><p>Chaque changement proposé passe une barrière de sécurité avant de devenir le défaut. Vérifier coûte moins cher que générer — proposer beaucoup, adopter peu (seulement le vérifié).</p></article>
+        <article class="card"><p class="k">// anti-bulle</p><h3>L'engagement n'est pas le but</h3><p>Un optimiseur d'engagement naïf vous rend plus à l'aise mais plus bête. ibrief sacrifie volontairement le score à court terme pour préserver diversité et invariants anti-bulle.</p></article>
+        <article class="card"><p class="k">// autoresearch encadré</p><h3>La profondeur, maîtrisée</h3><p>La recherche en plusieurs étapes (façon Karpathy) est puissante mais coûteuse et sujette aux hallucinations — d'où un module budgété, à citations obligatoires, pas un agent en roue libre.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="boucle">
+    <div class="wrap">
+      <p class="eyebrow">Le cercle d'auto-amélioration</p>
+      <h2>Livrer → Retour → Évaluer → Apprendre → Sécuriser.</h2>
+      <p class="lead">La même boucle tourne chaque nuit. Ce qui a été utile se renforce ; le reste s'estompe — dans des limites de sécurité strictes.</p>
+      <div class="loop">
+        <div class="node"><div class="n">01</div><h4>Livrer</h4><p>composer &amp; envoyer le briefing</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">02</div><h4>Retour</h4><p>👍/👎 via boutons Telegram</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">03</div><h4>Éval</h4><p>comportement + juge + structure</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">04</div><h4>Apprendre</h4><p>pondérations · prompts · sources</p></div>
+        <span class="arrow">→</span>
+        <div class="node"><div class="n">05</div><h4>Barrière</h4><p>vérifier · adopter · annuler</p></div>
+      </div>
+      <p class="loopback">↺ Le score comportemental fait foi ; le juge LLM sert surtout au démarrage à froid et se calibre sur les retours réels.</p>
+    </div>
+  </section>
+
+  <section id="axes">
+    <div class="wrap">
+      <p class="eyebrow">Trois axes, chacun sécurisé</p>
+      <h2>L'auto-amélioration n'est pas une fonction — il y en a trois.</h2>
+      <div class="axes">
+        <div class="axis"><span>Axe</span><span>Levier</span><span>Garde-fou</span></div>
+        <div class="axis"><div><strong>Pondérations</strong><br /><small>sources &amp; thèmes</small></div><div><small>Bandit manchot (Thompson / échantillonnage Beta) avec un plancher d'exploration [0.2, 2.0]</small></div><div><small>Barrière de sécurité : bornes + diversité des sources (max 50 %), versionné, retour arrière</small></div></div>
+        <div class="axis"><div><strong>Prompts</strong><br /><small>ex. synthèse TL;DR</small></div><div><small>Un LLM optimiseur génère des variantes ; un test fantôme note les deux sur la même entrée</small></div><div><small>Adopté seulement sur une marge nette du juge ; versionnage des prompts + journal d'expériences</small></div></div>
+        <div class="axis"><div><strong>Sources</strong><br /><small>registre de flux</small></div><div><small>Scoring de qualité depuis retours + fréquence de sélection ; les faibles sont retirées</small></div><div><small>Vigie de dérive (HHI) : en cas de rétrécissement, l'élagage est suspendu — l'ampleur prime sur le score</small></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <div class="wrap">
+      <p class="eyebrow">Le pipeline nocturne</p>
+      <h2>Du flux brut au briefing organisé.</h2>
+      <div class="pipe">
+        <span>Ingestion</span><b>→</b><span>Dédup.</span><b>→</b><span>Enrichir</span><b>→</b><span class="hot">Score (pondérations)</span><b>→</b><span>Curation</span><b>→</b><span class="hot">TL;DR (prompt appris)</span><b>→</b><span>Rendu</span><b>→</b><span>Persistance</span><b>→</b><span>Envoi</span>
+      </div>
+      <p class="lead" style="margin-top:1.6rem">Le <strong>palier de masse</strong> (résumés, étiquetage) tourne sur un petit modèle rapide, le <strong>palier de synthèse</strong> (curation, juge) sur un modèle de classe 70B — les deux en local. Tout le cycle d'apprentissage tourne la nuit quasiment gratuitement ; un modèle de pointe n'est sollicité qu'en option pour calibrer le juge via un abonnement existant (<code>claude -p</code>).</p>
+    </div>
+  </section>
+
+  <section id="anatomie">
+    <div class="wrap">
+      <p class="eyebrow">Anatomie d'un briefing</p>
+      <h2>Trois sections à l'intention claire.</h2>
+      <p class="lead">Les deux dernières <em>ne peuvent pas</em> être éliminées par la personnalisation. La boucle d'apprentissage ne peut pas vous optimiser vers une bulle confortable.</p>
+      <div class="anatomy">
+        <div class="row"><div class="label">Temps forts</div><p>Les nouvelles les plus importantes du jour — personnalisées via les pondérations apprises. Plus « Les 3 choses du jour » en résumé exécutif.</p></div>
+        <div class="row"><div class="label">Contrepoint <span class="pin">fixe</span></div><p>Un contre-argument sérieux et présenté avec honnêteté (steelman) face à votre propre position — pour connaître l'autre camp en conversation au lieu d'argumenter dans la bulle.</p></div>
+        <div class="row"><div class="label">Joker <span class="pin">fixe</span></div><p>Un article réel délibérément surprenant, hors de vos intérêts habituels — de préférence d'une source qui n'a pas atteint la sélection principale.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="feuille-de-route">
+    <div class="wrap">
+      <p class="eyebrow">Feuille de route — entièrement implémentée</p>
+      <h2>Six jalons, chacun utile en soi.</h2>
+      <div class="timeline">
+        <div class="ms"><div class="tag">M1 <span class="done">✓</span></div><div><h4>Briefing statique</h4><p>Ingestion → Enrichir → Curation → Rendu face à Ollama local.</p></div></div>
+        <div class="ms"><div class="tag">M2 <span class="done">✓</span></div><div><h4>Persistance &amp; retours</h4><p>SQLite (sqlx), dédup., enregistrements de briefing ; envoi Telegram avec boutons 👍/👎.</p></div></div>
+        <div class="ms"><div class="tag">M3 <span class="done">✓</span></div><div><h4>Moteur d'évaluation</h4><p>Score comportemental + juge LLM face à une grille versionnée + contrôles structurels déterministes.</p></div></div>
+        <div class="ms"><div class="tag">M4 <span class="done">✓</span></div><div><h4>Apprentissage : pondérations</h4><p>Bandit de Thompson sur sources/thèmes, barrière de sécurité, versionnage de config &amp; retour arrière.</p></div></div>
+        <div class="ms"><div class="tag">M5 <span class="done">✓</span></div><div><h4>Apprentissage : prompts</h4><p>LLM optimiseur + test fantôme ; primitive de décision A/B temporelle.</p></div></div>
+        <div class="ms"><div class="tag">M6 <span class="done">✓</span></div><div><h4>Évolution des sources + AutoResearch</h4><p>Scoring, élagage, vigie de dérive ; boucle de recherche approfondie encadrée avec vérification des citations.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="demarrage">
+    <div class="wrap">
+      <p class="eyebrow">Démarrage rapide</p>
+      <h2>En local en deux minutes.</h2>
+      <p class="lead">Prérequis : <a href="https://ollama.com">Ollama</a> avec un modèle de masse et un modèle de synthèse. Sur du matériel plus modeste, indiquez simplement des modèles plus petits dans <code>config/profile.toml</code>.</p>
+<pre><span class="c"># récupérer les modèles</span>
+ollama pull qwen2.5:14b      <span class="c"># palier de masse (enrichir)</span>
+ollama pull llama3.3:70b     <span class="c"># palier de synthèse (TL;DR, juge)</span>
+
+<span class="c"># composer un briefing</span>
+cargo run -p ibrief-app                 <span class="c"># = brief</span>
+
+<span class="c"># apprendre &amp; optimiser</span>
+cargo run -p ibrief-app -- <span class="a">eval</span>       <span class="c"># noter le briefing du jour</span>
+cargo run -p ibrief-app -- <span class="a">learn</span>      <span class="c"># apprendre les pondérations (Thompson + barrière)</span>
+cargo run -p ibrief-app -- <span class="a">optimize</span>   <span class="c"># améliorer le prompt TL;DR via test fantôme</span>
+cargo run -p ibrief-app -- <span class="a">sources</span> evolve   <span class="c"># noter les sources + vigie de dérive</span>
+cargo run -p ibrief-app -- <span class="a">research</span> <span class="a">"Quoi de neuf sur les LLM locaux ?"</span></pre>
+
+      <p class="eyebrow" style="margin-top:3rem">Pile technique</p>
+      <div class="stack">
+        <span><b>Rust</b> 1.95 · Edition 2024</span><span><b>Tokio</b> async</span><span><b>Ollama</b> LLM locaux</span><span><b>sqlx</b> + SQLite</span><span><b>feed-rs</b> ingestion</span><span><b>reqwest</b> API Telegram</span><span><b>rand_distr</b> Thompson</span><span>12 crates · CI au vert</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="wrap">
+      <p class="eyebrow">FAQ</p>
+      <h2>Questions fréquentes.</h2>
+      <div class="faq">
+        <details open><summary>Qu'est-ce qu'ibrief ?</summary><p>Un briefing matinal personnalisé et auto-améliorant. Il compose un briefing organisé pendant la nuit et s'adapte chaque jour aux retours mesurés — entièrement local en Rust, avec des LLM locaux via Ollama.</p></details>
+        <details><summary>Comment ibrief s'améliore-t-il tout seul ?</summary><p>Sur trois axes sécurisés : pondérations (bandit de Thompson), prompts (test fantôme) et sources (scoring plus une vigie de dérive). Chaque changement passe une barrière de sécurité, est versionné et réversible.</p></details>
+        <details><summary>Comment ibrief évite-t-il la bulle de filtre ?</summary><p>L'engagement n'est pas l'objectif d'optimisation. Deux sections — Contrepoint et Joker — ne peuvent pas être désactivées, et une vigie de dérive impose la diversité des sources, même au prix du score à court terme.</p></details>
+        <details><summary>Faut-il une API cloud ?</summary><p>Non. ibrief tourne entièrement en local avec Ollama. Un modèle de pointe cloud est optionnel et sert uniquement à la calibration périodique du juge via un abonnement existant (<code>claude -p</code>).</p></details>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>ibrief — un briefing matinal qui s'améliore tout seul · licence MIT</span>
+    <span><a href="https://github.com/asmuelle/ibrief">github.com/asmuelle/ibrief</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
