@@ -4,6 +4,8 @@
 //!   ibrief [brief] [--force]  Ingest → Dedup → Score → Enrich(Top-Kandidaten) → Curate → Render → Persist → (Push)
 //!                             `--force`: Cross-Day-Dedup überspringen, heutiges Briefing neu aufbauen
 //!   ibrief feedback           Telegram-Feedback-Loop: Button-Klicks → Store
+//!   ibrief feedback list [datum]              Items des Briefings mit Position anzeigen
+//!   ibrief feedback add <pos> <art> [datum]   Feedback ohne Telegram (art: up|down|more|less|open)
 //!   ibrief eval [datum] [calibrate]
 //!                             Briefing bewerten (Verhalten + Judge + Struktur) → evals-Tabelle
 //!   ibrief bench [enrich] [datum] [calibrate]
@@ -24,7 +26,7 @@
 //! Voraussetzungen: Ollama (brief/eval), IBRIEF_TELEGRAM_TOKEN (feedback/push).
 
 use anyhow::{Context, Result};
-use ibrief_core::BriefingSection;
+use ibrief_core::{BriefingSection, FeedbackKind};
 use ibrief_eval::{EvalWeights, RUBRIC_VERSION, bakeoff::Candidate};
 use ibrief_ingest::Source;
 use ibrief_llm::{ClaudeCodeModel, LanguageModel, OllamaClient};
@@ -108,7 +110,7 @@ async fn main() -> Result<()> {
 
     match command.as_str() {
         "brief" => run_brief(cfg_dir, &profile, &rest).await,
-        "feedback" => run_feedback(&profile).await,
+        "feedback" => run_feedback(&profile, &rest).await,
         "eval" => run_eval(&profile, &rest).await,
         "bench" => run_bench(&profile, &rest).await,
         "learn" => run_learn(&profile).await,
@@ -276,10 +278,63 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     Ok(())
 }
 
-async fn run_feedback(profile: &ProfileFile) -> Result<()> {
+async fn run_feedback(profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    match rest.first().map(String::as_str) {
+        Some("list") => feedback_list(profile, &rest[1..]).await,
+        Some("add") => feedback_add(profile, &rest[1..]).await,
+        // Ohne Subbefehl: Telegram-Loop (braucht Token + chat_id).
+        _ => {
+            let store = Store::open(&profile.store.path).await?;
+            let tg = telegram_from(profile)?;
+            tg.run_feedback_loop(&store).await
+        }
+    }
+}
+
+/// Zeigt die Items des Briefings mit ihrer Position (Eingabehilfe für `feedback add`).
+async fn feedback_list(profile: &ProfileFile, args: &[String]) -> Result<()> {
+    let date = args.first().cloned().unwrap_or_else(today);
     let store = Store::open(&profile.store.path).await?;
-    let tg = telegram_from(profile)?;
-    tg.run_feedback_loop(&store).await
+    let items = store.briefing_item_list(&date).await?;
+    if items.is_empty() {
+        anyhow::bail!("kein Briefing für {date} im Store");
+    }
+    println!("Briefing {date} — Items (Position für `feedback add`):");
+    for it in items {
+        println!(
+            "  [{:>2}] {:<12} {:<14} {}",
+            it.position, it.section_id, it.source_id, it.title
+        );
+    }
+    println!("\nFeedback geben: ibrief feedback add <position> <up|down|more|less|open> [datum]");
+    Ok(())
+}
+
+/// Schreibt ein Feedback-Ereignis für die Item-Position eines Briefings (ohne Telegram).
+async fn feedback_add(profile: &ProfileFile, args: &[String]) -> Result<()> {
+    let pos: i64 = args
+        .first()
+        .context("Position fehlt: ibrief feedback add <position> <art> [datum]")?
+        .parse()
+        .context("Position muss eine Zahl sein")?;
+    let kind_str = args
+        .get(1)
+        .context("Art fehlt (up|down|more|less|open)")?
+        .as_str();
+    let kind = FeedbackKind::parse(kind_str)
+        .with_context(|| format!("ungültige Art '{kind_str}' (up|down|more|less|open)"))?;
+    let date = args.get(2).cloned().unwrap_or_else(today);
+
+    let store = Store::open(&profile.store.path).await?;
+    let Some(item_id) = store.item_at(&date, pos).await? else {
+        anyhow::bail!("keine Position {pos} im Briefing {date} (siehe `feedback list {date}`)");
+    };
+    store.record_feedback(&date, &item_id, kind).await?;
+    println!(
+        "✓ {} für Position {pos} gespeichert ({item_id})",
+        kind.as_str()
+    );
+    Ok(())
 }
 
 async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {

@@ -60,6 +60,16 @@ pub struct ExperimentRow {
     pub created_at: String,
 }
 
+/// Ein Briefing-Item mit seiner globalen Position (für CLI-Feedback ohne Telegram).
+#[derive(Debug, Clone)]
+pub struct BriefingItemRef {
+    pub position: i64,
+    pub item_id: String,
+    pub section_id: String,
+    pub title: String,
+    pub source_id: String,
+}
+
 /// Eine Zeile der Modell-Bakeoff-Historie (`ibrief bench`) — ein Kandidat an einem Tag.
 #[derive(Debug, Clone)]
 pub struct BenchRunRow {
@@ -282,6 +292,13 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
+        // Alte Item-Zuordnungen des Tages entfernen, damit ein Neuaufbau (z.B. `brief --force`)
+        // nicht doppelte/mehrdeutige Positionen hinterlässt.
+        sqlx::query("DELETE FROM briefing_items WHERE briefing_date = ?")
+            .bind(b.date.as_str())
+            .execute(&self.pool)
+            .await?;
+
         let mut position: i64 = 0;
         for sec in &b.sections {
             for it in &sec.items {
@@ -312,6 +329,30 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.get::<String, _>("item_id")))
+    }
+
+    /// Listet die Items eines Briefings samt globaler Position (für `feedback list`).
+    pub async fn briefing_item_list(&self, date: &str) -> Result<Vec<BriefingItemRef>> {
+        let rows = sqlx::query(
+            "SELECT bi.position, bi.item_id, bi.section_id, ci.title, ci.source_id
+             FROM briefing_items bi
+             JOIN content_items ci ON ci.id = bi.item_id
+             WHERE bi.briefing_date = ?
+             ORDER BY bi.position",
+        )
+        .bind(date)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| BriefingItemRef {
+                position: r.get("position"),
+                item_id: r.get("item_id"),
+                section_id: r.get("section_id"),
+                title: r.get("title"),
+                source_id: r.get("source_id"),
+            })
+            .collect())
     }
 
     /// Schreibt ein Feedback-Ereignis.
@@ -869,6 +910,51 @@ mod tests {
             .record_feedback("2026-06-28", "a", FeedbackKind::Up)
             .await
             .unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn resaving_briefing_replaces_items_no_duplicate_positions() {
+        let path = std::env::temp_dir()
+            .join(format!("ibrief-rebrief-test-{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        let brief = |ids: &[&str]| Briefing {
+            date: "2026-06-29".into(),
+            tldr: vec![],
+            sections: vec![BriefingSection {
+                id: "ai_tech".into(),
+                title: "T".into(),
+                items: ids.iter().map(|i| item(i)).collect(),
+            }],
+        };
+
+        // Items müssen im Content-Store existieren (briefing_item_list JOINt darauf).
+        for id in ["a", "b", "c", "x", "y"] {
+            store.upsert_item(&item(id)).await.unwrap();
+        }
+
+        // Erster Lauf, dann Neuaufbau (wie `brief --force`) mit anderen Items.
+        store
+            .save_briefing(&brief(&["a", "b", "c"]), "v1")
+            .await
+            .unwrap();
+        store
+            .save_briefing(&brief(&["x", "y"]), "v1")
+            .await
+            .unwrap();
+
+        let items = store.briefing_item_list("2026-06-29").await.unwrap();
+        // Genau die neuen Items, eindeutige Positionen 0..n.
+        assert_eq!(items.len(), 2);
+        let positions: Vec<i64> = items.iter().map(|i| i.position).collect();
+        assert_eq!(positions, vec![0, 1]);
+        let ids: Vec<&str> = items.iter().map(|i| i.item_id.as_str()).collect();
+        assert_eq!(ids, vec!["x", "y"]);
 
         std::fs::remove_file(&path).ok();
     }
