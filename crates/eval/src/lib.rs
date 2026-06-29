@@ -243,6 +243,8 @@ mod tests {
             raw_summary: None,
             summary: Some("Ein Satz Zusammenfassung.".into()),
             topics: vec![],
+            entities: vec![],
+            embedding: None,
         }
     }
 

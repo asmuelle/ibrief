@@ -315,6 +315,8 @@ mod tests {
             raw_summary: Some("Quelltext des Artikels.".into()),
             summary: Some("Ein Satz.".into()),
             topics: vec![],
+            entities: vec![],
+            embedding: None,
         }
     }
 

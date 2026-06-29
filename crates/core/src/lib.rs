@@ -19,6 +19,12 @@ pub struct ContentItem {
     pub summary: Option<String>,
     /// Themen-Tags aus ENRICH.
     pub topics: Vec<String>,
+    /// Erkannte Entitäten (Personen, Firmen, etc.) aus ENRICH.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Embedding-Vektor für Dedup/Diversität/Neuheit (optional, noch nicht genutzt).
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Eine Sektion des Briefings (z.B. "KI & Tech").

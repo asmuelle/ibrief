@@ -116,6 +116,8 @@ const SCHEMA: &[&str] = &[
         raw_summary  TEXT,
         summary      TEXT,
         topics       TEXT NOT NULL DEFAULT '[]',
+        entities     TEXT NOT NULL DEFAULT '[]',
+        embedding    TEXT,
         first_seen   TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS briefings (
@@ -229,6 +231,13 @@ impl Store {
         for stmt in SCHEMA {
             sqlx::query(stmt).execute(&self.pool).await?;
         }
+        let _ =
+            sqlx::query("ALTER TABLE content_items ADD COLUMN entities TEXT NOT NULL DEFAULT '[]'")
+                .execute(&self.pool)
+                .await;
+        let _ = sqlx::query("ALTER TABLE content_items ADD COLUMN embedding TEXT")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -255,14 +264,22 @@ impl Store {
     /// Fügt ein Item ein oder aktualisiert Summary/Topics (first_seen bleibt erhalten).
     pub async fn upsert_item(&self, it: &ContentItem) -> Result<()> {
         let topics = serde_json::to_string(&it.topics)?;
+        let entities = serde_json::to_string(&it.entities)?;
+        let embedding = it
+            .embedding
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let published = it.published_at.map(|d| d.to_rfc3339());
         sqlx::query(
             "INSERT INTO content_items
-                (id, source_id, title, url, published_at, raw_summary, summary, topics, first_seen)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, source_id, title, url, published_at, raw_summary, summary, topics, entities, embedding, first_seen)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 summary = excluded.summary,
-                topics  = excluded.topics",
+                topics  = excluded.topics,
+                entities = excluded.entities,
+                embedding = excluded.embedding",
         )
         .bind(it.id.as_str())
         .bind(it.source_id.as_str())
@@ -272,6 +289,8 @@ impl Store {
         .bind(it.raw_summary.as_deref())
         .bind(it.summary.as_deref())
         .bind(topics)
+        .bind(entities)
+        .bind(embedding)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -415,7 +434,7 @@ impl Store {
 
         let rows = sqlx::query(
             "SELECT bi.section_id, ci.id, ci.source_id, ci.title, ci.url,
-                    ci.published_at, ci.raw_summary, ci.summary, ci.topics
+                    ci.published_at, ci.raw_summary, ci.summary, ci.topics, ci.entities, ci.embedding
              FROM briefing_items bi
              JOIN content_items ci ON ci.id = bi.item_id
              WHERE bi.briefing_date = ?
@@ -434,6 +453,11 @@ impl Store {
                 .map(|d| d.with_timezone(&chrono::Utc));
             let topics: Vec<String> =
                 serde_json::from_str(&row.get::<String, _>("topics")).unwrap_or_default();
+            let entities: Vec<String> =
+                serde_json::from_str(&row.get::<String, _>("entities")).unwrap_or_default();
+            let embedding: Option<Vec<f32>> = row
+                .get::<Option<String>, _>("embedding")
+                .and_then(|s| serde_json::from_str(&s).ok());
             let item = ContentItem {
                 id: row.get("id"),
                 source_id: row.get("source_id"),
@@ -443,6 +467,8 @@ impl Store {
                 raw_summary: row.get("raw_summary"),
                 summary: row.get("summary"),
                 topics,
+                entities,
+                embedding,
             };
             match sections.iter_mut().find(|s| s.id == section_id) {
                 Some(s) => s.items.push(item),
@@ -857,6 +883,8 @@ mod tests {
             raw_summary: None,
             summary: Some("sum".into()),
             topics: vec!["a".into()],
+            entities: vec![],
+            embedding: None,
         }
     }
 

@@ -28,19 +28,30 @@ struct EnrichOut {
 }
 
 /// ENRICH: für die ersten `max` Items eine Ein-Satz-Zusammenfassung + Tags erzeugen.
-/// Sequentiell gehalten (M1), um Ollama nicht zu überlasten.
+/// Läuft parallel in Batches à 4, um Ollama nicht zu überlasten.
 pub async fn enrich(
     mut items: Vec<ContentItem>,
     model: &dyn LanguageModel,
     max: usize,
 ) -> Vec<ContentItem> {
-    for item in items.iter_mut().take(max) {
-        match enrich_one(item, model).await {
-            Ok(out) => {
-                item.summary = Some(out.summary);
-                item.topics = out.topics;
+    let n = max.min(items.len());
+    const CONCURRENCY: usize = 4;
+    for chunk_start in (0..n).step_by(CONCURRENCY) {
+        let chunk_end = (chunk_start + CONCURRENCY).min(n);
+        let futs: Vec<_> = (chunk_start..chunk_end)
+            .map(|i| enrich_one(&items[i], model))
+            .collect();
+        let results = futures::future::join_all(futs).await;
+        for (i, result) in (chunk_start..).zip(results) {
+            match result {
+                Ok(out) => {
+                    items[i].summary = Some(out.summary);
+                    items[i].topics = out.topics;
+                }
+                Err(e) => {
+                    tracing::warn!(title = %items[i].title, error = %e, "enrich fehlgeschlagen")
+                }
             }
-            Err(e) => tracing::warn!(title = %item.title, error = %e, "enrich fehlgeschlagen"),
         }
     }
     items
@@ -224,6 +235,8 @@ pub async fn make_counterpoint(
         raw_summary: None,
         summary: Some(text),
         topics: vec![],
+        entities: vec![],
+        embedding: None,
     }))
 }
 
@@ -287,6 +300,8 @@ mod tests {
             raw_summary: None,
             summary: Some("s".into()),
             topics: vec![],
+            entities: vec![],
+            embedding: None,
         }
     }
 
@@ -348,5 +363,190 @@ mod tests {
         ];
         let b = curate(items, 4, 2);
         assert_eq!(b.sections[0].items.len(), 4);
+    }
+
+    mod integration {
+        use super::*;
+        use async_trait::async_trait;
+        use ibrief_llm::Completion;
+        use std::sync::Mutex;
+
+        /// Mock-Modell, das pro Aufruf die nächste Zeile eines Skripts liefert.
+        struct ScriptedModel {
+            label: String,
+            lines: Mutex<Vec<String>>,
+        }
+
+        impl ScriptedModel {
+            fn new(label: &str, mut responses: Vec<String>) -> Self {
+                responses.reverse();
+                Self {
+                    label: label.into(),
+                    lines: Mutex::new(responses),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl LanguageModel for ScriptedModel {
+            async fn complete(&self, _req: &Completion) -> anyhow::Result<String> {
+                self.lines
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .ok_or_else(|| anyhow::anyhow!("mock exhausted"))
+            }
+            fn label(&self) -> &str {
+                &self.label
+            }
+        }
+
+        #[tokio::test]
+        async fn full_pipeline_enrich_curate_render() {
+            let items: Vec<ContentItem> = (0..12)
+                .map(|i| {
+                    let src = if i < 6 { "verge" } else { "hn" };
+                    ContentItem {
+                        id: format!("item-{i}"),
+                        source_id: src.into(),
+                        title: format!("Artikel {i}"),
+                        url: format!("https://{src}.com/{i}"),
+                        published_at: None,
+                        raw_summary: Some(format!("Roh-Text von Artikel {i}.")),
+                        summary: None,
+                        topics: vec![],
+                        entities: vec![],
+                        embedding: None,
+                    }
+                })
+                .collect();
+
+            // Mock: gibt für jedes Item eine Zusammenfassung + Topics zurück.
+            let mut enrich_responses = Vec::new();
+            for i in 0..12 {
+                enrich_responses.push(format!(
+                    r#"{{"summary":"Zusammenfassung von Artikel {i}.","topics":["thema{i}"]}}"#
+                ));
+            }
+            let enrich_model = ScriptedModel::new("enrich-mock", enrich_responses);
+
+            // Mock: TL;DR gibt 3 Bullet Points.
+            let synth_model = ScriptedModel::new(
+                "synth-mock",
+                vec!["- Erste Sache\n- Zweite Sache\n- Dritte Sache".into()],
+            );
+
+            let counterpoint_model = ScriptedModel::new(
+                "counterpoint-mock",
+                vec!["Eine faire Gegenperspektive mit Substanz.".into()],
+            );
+
+            // ENRICH (parallel, batchweise)
+            let enriched = enrich(items, &enrich_model, 12).await;
+            assert_eq!(enriched.len(), 12);
+            for (i, it) in enriched.iter().enumerate() {
+                assert!(it.summary.is_some(), "Item {i} sollte eine Summary haben");
+                assert!(!it.topics.is_empty(), "Item {i} sollte Topics haben");
+            }
+
+            // SCORE → CURATE
+            let cfg = Config::default();
+            let ranked = rank(enriched, &cfg);
+            let mut briefing = curate(ranked, 8, 3);
+            briefing.date = "2026-06-29".into();
+
+            // TL;DR
+            let tldr = make_tldr(
+                &briefing,
+                &synth_model,
+                "Fasse diese Meldungen in 3 Kernpunkten zusammen:\n{items}",
+            )
+            .await
+            .unwrap();
+            assert_eq!(tldr.len(), 3);
+            briefing.tldr = tldr;
+
+            // COUNTERPOINT
+            let cp = make_counterpoint(&briefing, &counterpoint_model, &briefing.date)
+                .await
+                .unwrap();
+            assert!(cp.is_some(), "Gegenperspektive sollte erzeugt werden");
+            briefing.sections.push(BriefingSection {
+                id: "counterpoint".into(),
+                title: "Gegenperspektive".into(),
+                items: vec![cp.unwrap()],
+            });
+
+            // WILDCARD aus den restlichen Items
+            let wildcard = pick_wildcard(
+                &briefing.sections[0].items,
+                briefing.sections[0].items.len().max(8),
+            );
+            if let Some(w) = wildcard {
+                briefing.sections.push(BriefingSection {
+                    id: "wildcard".into(),
+                    title: "Wildcard".into(),
+                    items: vec![w],
+                });
+            }
+
+            // RENDER
+            let md = render(&briefing);
+            assert!(md.contains("# Morning Briefing — 2026-06-29"));
+            assert!(md.contains("## Die 3 Dinge heute"));
+            assert!(md.contains("Erste Sache"));
+            assert!(md.contains("Zweite Sache"));
+            assert!(md.contains("Dritte Sache"));
+            assert!(md.contains("## KI & Tech — Highlights"));
+            assert!(md.contains("Gegenperspektive"));
+            let n_sections = briefing.sections.len();
+            assert!(n_sections >= 2, "mindestens Haupt- und Gegenperspektive");
+
+            // Keine Items ohne Summary in der Ausgabe
+            for sec in &briefing.sections {
+                for it in &sec.items {
+                    assert!(
+                        it.summary.is_some() || it.title == "Gegenperspektive",
+                        "Item {} ({}) in Sektion {} hat keine Summary",
+                        it.id,
+                        it.title,
+                        sec.id
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn enrich_handles_partial_failures() {
+            let items: Vec<ContentItem> = (0..5)
+                .map(|i| ContentItem {
+                    id: format!("fail-{i}"),
+                    source_id: "s".into(),
+                    title: format!("Titel {i}"),
+                    url: format!("https://s.com/{i}"),
+                    published_at: None,
+                    raw_summary: Some("Text.".into()),
+                    summary: None,
+                    topics: vec![],
+                    entities: vec![],
+                    embedding: None,
+                })
+                .collect();
+
+            // Nur 3 von 5 Responses — die letzten beiden schlagen fehl.
+            let mut responses = Vec::new();
+            for i in 0..3 {
+                responses.push(format!(r#"{{"summary":"Summary {i}","topics":["t{i}"]}}"#));
+            }
+            let model = ScriptedModel::new("partial", responses);
+
+            let enriched = enrich(items, &model, 5).await;
+            assert_eq!(enriched.len(), 5);
+            assert!(enriched[0].summary.is_some());
+            assert!(enriched[1].summary.is_some());
+            assert!(enriched[2].summary.is_some());
+            assert!(enriched[3].summary.is_none());
+            assert!(enriched[4].summary.is_none());
+        }
     }
 }

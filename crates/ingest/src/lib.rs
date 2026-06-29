@@ -65,6 +65,8 @@ async fn fetch_one(client: &reqwest::Client, src: &Source) -> Result<Vec<Content
                 raw_summary,
                 summary: None,
                 topics: Vec::new(),
+                entities: Vec::new(),
+                embedding: None,
             }
         })
         .collect();

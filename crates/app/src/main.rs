@@ -38,7 +38,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CONFIG_VERSION: &str = "m3-dev";
 const TOKEN_ENV: &str = "IBRIEF_TELEGRAM_TOKEN";
 const CONFIG_DIR_ENV: &str = "IBRIEF_CONFIG_DIR";
 /// Max. Anteil einer einzelnen Quelle im Briefing (muss zum Diversitäts-Check in ibrief_eval passen).
@@ -252,7 +251,11 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     }
 
     // PERSIST Briefing-Record
-    store.save_briefing(&briefing, CONFIG_VERSION).await?;
+    let config_version = store
+        .active_config_version()
+        .await?
+        .unwrap_or_else(|| "default".to_string());
+    store.save_briefing(&briefing, &config_version).await?;
 
     // RENDER (Datei)
     let md = ibrief_pipeline::render(&briefing);
@@ -372,10 +375,14 @@ async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {
     )
     .await;
 
+    let config_version = store
+        .active_config_version()
+        .await?
+        .unwrap_or_else(|| "default".to_string());
     store
         .save_eval(&EvalRow {
             date: date.clone(),
-            config_version: CONFIG_VERSION.to_string(),
+            config_version: config_version.clone(),
             rubric_version: RUBRIC_VERSION.to_string(),
             behavior: res.behavior,
             judge: res.judge,
@@ -385,7 +392,7 @@ async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {
         })
         .await?;
 
-    println!("Eval {date} (config {CONFIG_VERSION}, rubric {RUBRIC_VERSION}):");
+    println!("Eval {date} (config {config_version}, rubric {RUBRIC_VERSION}):");
     println!(
         "  total={:.2}  [behavior={:.2} judge={:.2} structure={:.2}]",
         res.total, res.behavior, res.judge, res.structure

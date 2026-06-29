@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Eine Anfrage an ein Sprachmodell.
 #[derive(Debug, Clone)]
@@ -152,6 +153,7 @@ pub struct ClaudeCodeModel {
     binary: String,
     model: Option<String>,
     label: String,
+    timeout: Duration,
 }
 
 impl ClaudeCodeModel {
@@ -161,6 +163,7 @@ impl ClaudeCodeModel {
             binary: "claude".into(),
             model,
             label: "claude-code(abo)".into(),
+            timeout: Duration::from_secs(120),
         }
     }
 }
@@ -188,12 +191,14 @@ impl LanguageModel for ClaudeCodeModel {
             cmd.arg("--model").arg(m);
         }
 
-        let out = cmd.output().await.with_context(|| {
-            format!(
-                "`{}` (Claude Code CLI) konnte nicht gestartet werden",
-                self.binary
-            )
-        })?;
+        let out = tokio::time::timeout(self.timeout, cmd.output())
+            .await
+            .with_context(|| {
+                format!(
+                    "`{}` (Claude Code CLI) timed out after {:?}",
+                    self.binary, self.timeout
+                )
+            })??;
 
         if !out.status.success() {
             anyhow::bail!(
