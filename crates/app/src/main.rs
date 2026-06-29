@@ -1,7 +1,8 @@
 //! ibrief M3 — Briefing (M1) + Persistenz/Feedback (M2) + Eval Engine (M3).
 //!
 //! Befehle:
-//!   ibrief [brief]            Ingest → Dedup → Enrich → Score(Gewichte) → Curate → Render → Persist → (Push)
+//!   ibrief [brief] [--force]  Ingest → Dedup → Score → Enrich(Top-Kandidaten) → Curate → Render → Persist → (Push)
+//!                             `--force`: Cross-Day-Dedup überspringen, heutiges Briefing neu aufbauen
 //!   ibrief feedback           Telegram-Feedback-Loop: Button-Klicks → Store
 //!   ibrief eval [datum] [calibrate]
 //!                             Briefing bewerten (Verhalten + Judge + Struktur) → evals-Tabelle
@@ -37,6 +38,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CONFIG_VERSION: &str = "m3-dev";
 const TOKEN_ENV: &str = "IBRIEF_TELEGRAM_TOKEN";
 const CONFIG_DIR_ENV: &str = "IBRIEF_CONFIG_DIR";
+/// Max. Anteil einer einzelnen Quelle im Briefing (muss zum Diversitäts-Check in ibrief_eval passen).
+const MAX_SOURCE_SHARE: f64 = 0.6;
 
 #[derive(Deserialize)]
 struct ProfileFile {
@@ -99,7 +102,7 @@ async fn main() -> Result<()> {
     let profile: ProfileFile = load_toml(cfg_dir.join("profile.toml"))?;
 
     match command.as_str() {
-        "brief" => run_brief(cfg_dir, &profile).await,
+        "brief" => run_brief(cfg_dir, &profile, &rest).await,
         "feedback" => run_feedback(&profile).await,
         "eval" => run_eval(&profile, &rest).await,
         "bench" => run_bench(&profile, &rest).await,
@@ -115,7 +118,8 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_brief(cfg_dir: &Path, profile: &ProfileFile) -> Result<()> {
+async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    let force = rest.iter().any(|a| a == "--force" || a == "force");
     let store = Store::open(&profile.store.path).await?;
 
     // Quellen-Registry: aus sources.toml seeden (idempotent), dann aktive Quellen laden.
@@ -129,33 +133,56 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile) -> Result<()> {
         })
         .collect();
 
-    // INGEST + DEDUP
+    // INGEST + DEDUP (Intra-Batch gegen Feed-Doppel, dann Cross-Day gegen den Store)
     tracing::info!(sources = sources.len(), "INGEST");
     let fetched = ibrief_ingest::fetch_all(&sources).await;
-    let fresh = store.filter_unseen(fetched).await?;
-    tracing::info!(fresh = fresh.len(), "neue Items nach Dedup");
+    let deduped = ibrief_pipeline::dedup_batch(fetched);
+    let fresh = if force {
+        tracing::warn!("--force: Cross-Day-Dedup übersprungen, Briefing wird neu aufgebaut");
+        deduped
+    } else {
+        store.filter_unseen(deduped).await?
+    };
+    tracing::info!(fresh = fresh.len(), "Items nach Dedup");
     if fresh.is_empty() {
-        tracing::warn!("keine neuen Items — nichts zu briefen");
+        tracing::warn!(
+            "keine neuen Items — nichts zu briefen (Tipp: `brief --force` baut heute neu)"
+        );
         return Ok(());
     }
 
-    // ENRICH (Massen-Tier) + Persist
+    // SCORE zuerst, dann nur die Kandidaten anreichern, die auch kuratiert werden.
+    // (Sonst werden die ersten N in Fetch-Reihenfolge enriched, aber die aktuellsten gezeigt.)
+    let cfg = ibrief_learn::load_active(&store).await?;
+    if !force {
+        // Neue Items als „gesehen" markieren (roh), damit sie nicht erneut auftauchen.
+        for it in &fresh {
+            store.upsert_item(it).await?;
+        }
+    }
+    let pre_ranked = ibrief_pipeline::rank(fresh, &cfg);
+    let candidate_n = profile.llm.max_items_enrich.max(profile.llm.top_n);
+    let candidates: Vec<_> = pre_ranked.into_iter().take(candidate_n).collect();
+
+    // ENRICH (Massen-Tier) nur über die Kandidaten + Persist (jetzt mit Summary/Topics)
     let enrich_model = OllamaClient::new(
         profile.llm.ollama_url.clone(),
         profile.llm.enrich_model.clone(),
     );
-    tracing::info!(model = enrich_model.label(), "ENRICH");
-    let enriched =
-        ibrief_pipeline::enrich(fresh, &enrich_model, profile.llm.max_items_enrich).await;
+    let n_cand = candidates.len();
+    tracing::info!(model = enrich_model.label(), candidates = n_cand, "ENRICH");
+    let enriched = ibrief_pipeline::enrich(candidates, &enrich_model, n_cand).await;
     for it in &enriched {
         store.upsert_item(it).await?;
     }
 
-    // SCORE (gelernte Gewichte) + CURATE
-    let cfg = ibrief_learn::load_active(&store).await?;
+    // RE-RANK (jetzt mit Topics) → Wildcard + quellen-diverse Kuration
     let ranked = ibrief_pipeline::rank(enriched, &cfg);
     let wildcard = ibrief_pipeline::pick_wildcard(&ranked, profile.llm.top_n);
-    let mut briefing = ibrief_pipeline::curate(ranked, profile.llm.top_n);
+    let max_per_source = ((profile.llm.top_n as f64) * MAX_SOURCE_SHARE)
+        .floor()
+        .max(1.0) as usize;
+    let mut briefing = ibrief_pipeline::curate(ranked, profile.llm.top_n, max_per_source);
     briefing.date = today();
 
     // TL;DR (Synthese-Tier, mit aktivem/gelerntem Prompt)
