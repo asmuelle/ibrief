@@ -5,6 +5,11 @@
 //!   ibrief feedback           Telegram-Feedback-Loop: Button-Klicks → Store
 //!   ibrief eval [datum] [calibrate]
 //!                             Briefing bewerten (Verhalten + Judge + Struktur) → evals-Tabelle
+//!   ibrief bench [enrich] [datum] [calibrate]
+//!                             Modelle gegeneinander testen (A/B-Bakeoff) → Ranking.
+//!                             Default: Synth-Tier (TL;DR/Gegenperspektive).
+//!                             `enrich`: Massen-Tier (Ein-Satz-Zusammenfassungen je Item).
+//!   ibrief bench list         Bakeoff-Historie anzeigen (Modell-Vergleiche über Tage)
 //!   ibrief learn              Gewichte lernen (Thompson + Safety Gate) → neue Config-Version
 //!   ibrief config list        Config-Historie anzeigen (aktive markiert)
 //!   ibrief config rollback <version>   Auf frühere Config-Version zurücksetzen
@@ -19,10 +24,10 @@
 
 use anyhow::{Context, Result};
 use ibrief_core::BriefingSection;
-use ibrief_eval::{EvalWeights, RUBRIC_VERSION};
+use ibrief_eval::{EvalWeights, RUBRIC_VERSION, bakeoff::Candidate};
 use ibrief_ingest::Source;
 use ibrief_llm::{ClaudeCodeModel, LanguageModel, OllamaClient};
-use ibrief_store::{EvalRow, Store};
+use ibrief_store::{BenchRunRow, EvalRow, Store};
 use ibrief_telegram::Telegram;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -55,6 +60,12 @@ struct LlmConfig {
     synth_model: String,
     max_items_enrich: usize,
     top_n: usize,
+    /// A/B-Kandidaten für den Synthese-Tier (`ibrief bench`).
+    #[serde(default)]
+    synth_candidates: Vec<String>,
+    /// A/B-Kandidaten für den Enrich-Tier (`ibrief bench enrich`).
+    #[serde(default)]
+    enrich_candidates: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +102,7 @@ async fn main() -> Result<()> {
         "brief" => run_brief(cfg_dir, &profile).await,
         "feedback" => run_feedback(&profile).await,
         "eval" => run_eval(&profile, &rest).await,
+        "bench" => run_bench(&profile, &rest).await,
         "learn" => run_learn(&profile).await,
         "config" => run_config(&profile, &rest).await,
         "optimize" => run_optimize(&profile, &rest).await,
@@ -98,7 +110,7 @@ async fn main() -> Result<()> {
         "sources" => run_sources(cfg_dir, &profile, &rest).await,
         "research" => run_research(&profile, &rest).await,
         other => anyhow::bail!(
-            "unbekannter Befehl '{other}' (erwartet: brief | feedback | eval | learn | config | optimize | experiment | sources | research)"
+            "unbekannter Befehl '{other}' (erwartet: brief | feedback | eval | bench | learn | config | optimize | experiment | sources | research)"
         ),
     }
 }
@@ -271,6 +283,243 @@ async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {
         println!("  · {n}");
     }
     Ok(())
+}
+
+async fn run_bench(profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    if rest.iter().any(|a| a == "list") {
+        return run_bench_list(profile).await;
+    }
+
+    let calibrate = rest.iter().any(|a| a == "calibrate");
+    let enrich_mode = rest.iter().any(|a| a == "enrich");
+    // Datum = erstes Argument, das kein Schlüsselwort ist.
+    let keywords = ["calibrate", "enrich", "synth", "list"];
+    let date = rest
+        .iter()
+        .find(|a| !keywords.contains(&a.as_str()))
+        .cloned()
+        .unwrap_or_else(today);
+
+    let store = Store::open(&profile.store.path).await?;
+    let Some(briefing) = store.load_briefing(&date).await? else {
+        anyhow::bail!("kein Briefing für {date} im Store (erst `ibrief brief` für diesen Tag)");
+    };
+
+    // Judge: lokal (aktives synth_model) oder Abo-Kalibrierung (claude -p). Für alle Kandidaten gleich.
+    let judge: Box<dyn LanguageModel> = if calibrate {
+        tracing::info!("Bakeoff-Judge via Abo-Kalibrierung (claude -p)");
+        Box::new(ClaudeCodeModel::new(Some("opus".to_string())))
+    } else {
+        Box::new(OllamaClient::new(
+            profile.llm.ollama_url.clone(),
+            profile.llm.synth_model.clone(),
+        ))
+    };
+
+    if enrich_mode {
+        run_bench_enrich(profile, &store, &briefing, judge.as_ref(), calibrate, &date).await
+    } else {
+        run_bench_synth(profile, &store, &briefing, judge.as_ref(), calibrate, &date).await
+    }
+}
+
+/// Baut Kandidaten-Clients: das aktive `baseline`-Modell ist immer dabei.
+fn bench_candidates<'a>(
+    ollama_url: &str,
+    baseline: &str,
+    configured: &[String],
+    models: &'a mut Vec<OllamaClient>,
+) -> Vec<Candidate<'a>> {
+    let mut names: Vec<String> = configured.to_vec();
+    if !names.iter().any(|n| n == baseline) {
+        names.insert(0, baseline.to_string());
+    }
+    *models = names
+        .iter()
+        .map(|m| OllamaClient::new(ollama_url.to_string(), m.clone()))
+        .collect();
+    names
+        .into_iter()
+        .zip(models.iter())
+        .map(|(name, model)| Candidate { name, model })
+        .collect()
+}
+
+async fn run_bench_synth(
+    profile: &ProfileFile,
+    store: &Store,
+    briefing: &ibrief_core::Briefing,
+    judge: &dyn LanguageModel,
+    calibrate: bool,
+    date: &str,
+) -> Result<()> {
+    let feedback = store.feedback_counts(date).await?;
+    let mut models = Vec::new();
+    let candidates = bench_candidates(
+        &profile.llm.ollama_url,
+        &profile.llm.synth_model,
+        &profile.llm.synth_candidates,
+        &mut models,
+    );
+
+    // Feste TL;DR-Vorlage (aktiver, gelernter Prompt) — nur das Modell variiert.
+    let tldr_prompt = ibrief_optimize::active_tldr(store).await?;
+    let weights = EvalWeights::default();
+
+    let outcome = ibrief_eval::bakeoff::run(
+        briefing,
+        &feedback,
+        profile.profile.reading_time_min,
+        &weights,
+        judge,
+        &tldr_prompt.template,
+        &candidates,
+    )
+    .await;
+
+    let judge_mode = if calibrate { "abo" } else { "lokal" };
+    println!(
+        "Synth-Bakeoff {date} (judge={judge_mode}, prompt={}, baseline={}):",
+        tldr_prompt.version, profile.llm.synth_model
+    );
+    for (i, e) in outcome.entries.iter().enumerate() {
+        let star = baseline_marker(&e.name, &profile.llm.synth_model);
+        println!(
+            "  {}. {:<18} total={:.2}  [judge={:.2} struct={:.2}]  {} ms{star}",
+            i + 1,
+            e.name,
+            e.eval.total,
+            e.eval.judge,
+            e.eval.structure,
+            e.elapsed_ms,
+        );
+        store
+            .save_bench_run(&BenchRunRow {
+                date: date.to_string(),
+                tier: "synth".into(),
+                model: e.name.clone(),
+                judge_mode: judge_mode.into(),
+                total: e.eval.total,
+                scores: vec![
+                    ("judge".into(), e.eval.judge),
+                    ("struct".into(), e.eval.structure),
+                    ("behavior".into(), e.eval.behavior),
+                ],
+                items_scored: 0,
+                elapsed_ms: e.elapsed_ms as i64,
+                is_winner: i == 0,
+            })
+            .await?;
+    }
+    if let Some(w) = outcome.winner() {
+        println!(
+            "→ Gewinner: {} (total {:.2}) · in Historie gespeichert",
+            w.name, w.eval.total
+        );
+    }
+    Ok(())
+}
+
+async fn run_bench_enrich(
+    profile: &ProfileFile,
+    store: &Store,
+    briefing: &ibrief_core::Briefing,
+    judge: &dyn LanguageModel,
+    calibrate: bool,
+    date: &str,
+) -> Result<()> {
+    let mut models = Vec::new();
+    let candidates = bench_candidates(
+        &profile.llm.ollama_url,
+        &profile.llm.enrich_model,
+        &profile.llm.enrich_candidates,
+        &mut models,
+    );
+
+    let outcome = ibrief_eval::bakeoff::run_enrich(
+        briefing,
+        judge,
+        profile.llm.max_items_enrich,
+        &candidates,
+    )
+    .await;
+
+    let judge_mode = if calibrate { "abo" } else { "lokal" };
+    println!(
+        "Enrich-Bakeoff {date} (judge={judge_mode}, baseline={}):",
+        profile.llm.enrich_model
+    );
+    for (i, e) in outcome.entries.iter().enumerate() {
+        let star = baseline_marker(&e.name, &profile.llm.enrich_model);
+        println!(
+            "  {}. {:<18} total={:.2}  [treue={:.2} prägnanz={:.2} tags={:.2}]  {} Items  {} ms{star}",
+            i + 1,
+            e.name,
+            e.total,
+            e.faithfulness,
+            e.concision,
+            e.tags,
+            e.items_scored,
+            e.elapsed_ms,
+        );
+        store
+            .save_bench_run(&BenchRunRow {
+                date: date.to_string(),
+                tier: "enrich".into(),
+                model: e.name.clone(),
+                judge_mode: judge_mode.into(),
+                total: e.total,
+                scores: vec![
+                    ("treue".into(), e.faithfulness),
+                    ("prägnanz".into(), e.concision),
+                    ("tags".into(), e.tags),
+                ],
+                items_scored: e.items_scored as i64,
+                elapsed_ms: e.elapsed_ms as i64,
+                is_winner: i == 0,
+            })
+            .await?;
+    }
+    if let Some(w) = outcome.winner() {
+        println!(
+            "→ Gewinner: {} (total {:.2}) · in Historie gespeichert",
+            w.name, w.total
+        );
+    }
+    Ok(())
+}
+
+/// Zeigt die Bakeoff-Historie (`ibrief bench list`) — neueste Läufe zuerst.
+async fn run_bench_list(profile: &ProfileFile) -> Result<()> {
+    let store = Store::open(&profile.store.path).await?;
+    let runs = store.recent_bench_runs(40).await?;
+    if runs.is_empty() {
+        println!("noch keine Bakeoff-Läufe (erst `ibrief bench` oder `ibrief bench enrich`)");
+        return Ok(());
+    }
+    for r in runs {
+        let star = if r.is_winner { "★" } else { " " };
+        let subs: Vec<String> = r
+            .scores
+            .iter()
+            .map(|(k, v)| format!("{k}={v:.2}"))
+            .collect();
+        println!(
+            "{star} {} {:<7} {:<18} total={:.2}  [{}]  {} ms  (judge {})",
+            r.date,
+            r.tier,
+            r.model,
+            r.total,
+            subs.join(" "),
+            r.elapsed_ms,
+            r.judge_mode,
+        );
+    }
+    Ok(())
+}
+
+fn baseline_marker(name: &str, baseline: &str) -> &'static str {
+    if name == baseline { " (baseline)" } else { "" }
 }
 
 async fn run_learn(profile: &ProfileFile) -> Result<()> {

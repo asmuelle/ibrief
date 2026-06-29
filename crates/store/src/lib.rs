@@ -60,6 +60,25 @@ pub struct ExperimentRow {
     pub created_at: String,
 }
 
+/// Eine Zeile der Modell-Bakeoff-Historie (`ibrief bench`) — ein Kandidat an einem Tag.
+#[derive(Debug, Clone)]
+pub struct BenchRunRow {
+    pub date: String,
+    /// "synth" oder "enrich".
+    pub tier: String,
+    /// Kandidaten-Modellname (z.B. "gemma4:31b").
+    pub model: String,
+    /// "lokal" oder "abo" (Judge-Backend).
+    pub judge_mode: String,
+    pub total: f64,
+    /// Tier-spezifische Sub-Noten in Anzeige-Reihenfolge (z.B. judge/struct bzw. treue/prägnanz/tags).
+    pub scores: Vec<(String, f64)>,
+    /// Bewertete Items (nur Enrich-Tier; 0 beim Synth-Tier).
+    pub items_scored: i64,
+    pub elapsed_ms: i64,
+    pub is_winner: bool,
+}
+
 /// Eine Quelle in der (lernenden) Registry.
 #[derive(Debug, Clone)]
 pub struct SourceRow {
@@ -161,6 +180,19 @@ const SCHEMA: &[&str] = &[
         quality    REAL NOT NULL DEFAULT 0.5,
         reason     TEXT NOT NULL DEFAULT 'seed',
         created_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS bench_runs (
+        date         TEXT NOT NULL,
+        tier         TEXT NOT NULL,
+        model        TEXT NOT NULL,
+        judge_mode   TEXT NOT NULL,
+        total        REAL NOT NULL,
+        scores       TEXT NOT NULL DEFAULT '[]',
+        items_scored INTEGER NOT NULL DEFAULT 0,
+        elapsed_ms   INTEGER NOT NULL DEFAULT 0,
+        is_winner    INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL,
+        PRIMARY KEY (date, tier, model)
     )",
 ];
 
@@ -613,6 +645,57 @@ impl Store {
             .collect())
     }
 
+    /// Speichert ein Bakeoff-Ergebnis (idempotent pro date × tier × model — Re-Run überschreibt).
+    pub async fn save_bench_run(&self, r: &BenchRunRow) -> Result<()> {
+        let scores = serde_json::to_string(&r.scores)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO bench_runs
+                (date, tier, model, judge_mode, total, scores, items_scored, elapsed_ms, is_winner, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(r.date.as_str())
+        .bind(r.tier.as_str())
+        .bind(r.model.as_str())
+        .bind(r.judge_mode.as_str())
+        .bind(r.total)
+        .bind(scores)
+        .bind(r.items_scored)
+        .bind(r.elapsed_ms)
+        .bind(r.is_winner as i64)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Jüngste Bakeoff-Läufe (für `bench list`), neueste zuerst, innerhalb eines Laufs bestes zuerst.
+    pub async fn recent_bench_runs(&self, limit: i64) -> Result<Vec<BenchRunRow>> {
+        let rows = sqlx::query(
+            "SELECT date, tier, model, judge_mode, total, scores, items_scored, elapsed_ms, is_winner
+             FROM bench_runs
+             ORDER BY created_at DESC, date DESC, tier ASC, total DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| BenchRunRow {
+                date: r.get("date"),
+                tier: r.get("tier"),
+                model: r.get("model"),
+                judge_mode: r.get("judge_mode"),
+                total: r.get("total"),
+                scores: serde_json::from_str(&r.get::<String, _>("scores")).unwrap_or_default(),
+                items_scored: r.get("items_scored"),
+                elapsed_ms: r.get("elapsed_ms"),
+                is_winner: r.get::<i64, _>("is_winner") != 0,
+            })
+            .collect())
+    }
+
     /// Legt eine Quelle an (idempotent — Seed aus sources.toml).
     pub async fn seed_source(&self, id: &str, url: &str, reason: &str) -> Result<()> {
         sqlx::query(
@@ -786,6 +869,59 @@ mod tests {
             .record_feedback("2026-06-28", "a", FeedbackKind::Up)
             .await
             .unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn bench_runs_roundtrip_and_overwrite() {
+        let path = std::env::temp_dir()
+            .join(format!("ibrief-bench-test-{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = Store::open(&path).await.unwrap();
+        let row = |model: &str, total: f64, winner: bool| BenchRunRow {
+            date: "2026-06-29".into(),
+            tier: "synth".into(),
+            model: model.into(),
+            judge_mode: "lokal".into(),
+            total,
+            scores: vec![("judge".into(), 0.8), ("struct".into(), 1.0)],
+            items_scored: 0,
+            elapsed_ms: 1200,
+            is_winner: winner,
+        };
+
+        store
+            .save_bench_run(&row("gemma4:31b", 0.82, true))
+            .await
+            .unwrap();
+        store
+            .save_bench_run(&row("qwen3:32b", 0.80, false))
+            .await
+            .unwrap();
+
+        let runs = store.recent_bench_runs(10).await.unwrap();
+        assert_eq!(runs.len(), 2);
+        // Sub-Scores überleben den Round-Trip in Reihenfolge.
+        let g = runs.iter().find(|r| r.model == "gemma4:31b").unwrap();
+        assert!(g.is_winner);
+        assert_eq!(
+            g.scores,
+            vec![("judge".into(), 0.8), ("struct".into(), 1.0)]
+        );
+
+        // Re-Run überschreibt denselben (date, tier, model) statt zu duplizieren.
+        store
+            .save_bench_run(&row("gemma4:31b", 0.90, true))
+            .await
+            .unwrap();
+        let runs = store.recent_bench_runs(10).await.unwrap();
+        assert_eq!(runs.len(), 2);
+        let g = runs.iter().find(|r| r.model == "gemma4:31b").unwrap();
+        assert!((g.total - 0.90).abs() < 1e-9);
 
         std::fs::remove_file(&path).ok();
     }

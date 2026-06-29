@@ -15,6 +15,8 @@ use ibrief_store::FeedbackCounts;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+pub mod bakeoff;
+
 pub const RUBRIC_VERSION: &str = "r1";
 
 const WORDS_PER_MIN: f64 = 200.0;
@@ -219,7 +221,7 @@ fn brief_to_text(b: &Briefing) -> String {
 }
 
 /// Toleriert ```json-Fences / umgebende Prosa um das JSON-Objekt.
-fn extract_json(s: &str) -> String {
+pub(crate) fn extract_json(s: &str) -> String {
     match (s.find('{'), s.rfind('}')) {
         (Some(a), Some(b)) if b >= a => s[a..=b].to_string(),
         _ => s.to_string(),
