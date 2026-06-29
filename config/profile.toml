@@ -12,6 +12,9 @@ enrich_model = "gemma4:26b"
 synth_model = "gemma4:31b"
 max_items_enrich = 15
 top_n = 8
+# Quellen mit quality < diesem Wert werden nicht kuratiert (0.0 = aus). Seed-Qualität ist 0.5;
+# `ibrief sources evolve` senkt schwache Quellen darunter. Lenient gewählt, damit neue Quellen passieren.
+min_source_quality = 0.3
 
 # A/B-Bakeoff (`ibrief bench`): Kandidaten für den Synthese-Tier (Reasoning/Wildcard).
 # Das aktive synth_model ist immer als Baseline dabei. Leer lassen = nur Baseline.

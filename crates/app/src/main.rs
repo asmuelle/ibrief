@@ -32,6 +32,7 @@ use ibrief_store::{BenchRunRow, EvalRow, Store};
 use ibrief_telegram::Telegram;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +64,10 @@ struct LlmConfig {
     synth_model: String,
     max_items_enrich: usize,
     top_n: usize,
+    /// Quellen mit `quality` unter diesem Wert werden nicht kuratiert (0.0 = Filter aus).
+    /// Greift mit `sources evolve` zusammen, das die Qualität pflegt.
+    #[serde(default)]
+    min_source_quality: f64,
     /// A/B-Kandidaten für den Synthese-Tier (`ibrief bench`).
     #[serde(default)]
     synth_candidates: Vec<String>,
@@ -125,6 +130,8 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     // Quellen-Registry: aus sources.toml seeden (idempotent), dann aktive Quellen laden.
     seed_sources(cfg_dir, &store).await?;
     let active = store.active_sources().await?;
+    // Qualität je Quelle merken (für den Kurations-Floor weiter unten).
+    let quality: HashMap<String, f64> = active.iter().map(|s| (s.id.clone(), s.quality)).collect();
     let sources: Vec<Source> = active
         .into_iter()
         .map(|s| Source {
@@ -143,7 +150,29 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     } else {
         store.filter_unseen(deduped).await?
     };
-    tracing::info!(fresh = fresh.len(), "Items nach Dedup");
+
+    // Qualitäts-Floor: Items aus Quellen unter dem Schwellwert nicht kuratieren.
+    // Unbekannte Quellen (sollte nicht vorkommen) passieren mit 1.0.
+    let min_q = profile.llm.min_source_quality;
+    let fresh: Vec<_> = if min_q > 0.0 {
+        let before = fresh.len();
+        let kept: Vec<_> = fresh
+            .into_iter()
+            .filter(|it| quality.get(&it.source_id).copied().unwrap_or(1.0) >= min_q)
+            .collect();
+        if kept.len() < before {
+            tracing::info!(
+                dropped = before - kept.len(),
+                min_quality = min_q,
+                "Quellen-Qualitätsfilter angewandt"
+            );
+        }
+        kept
+    } else {
+        fresh
+    };
+
+    tracing::info!(fresh = fresh.len(), "Items nach Dedup/Filter");
     if fresh.is_empty() {
         tracing::warn!(
             "keine neuen Items — nichts zu briefen (Tipp: `brief --force` baut heute neu)"
