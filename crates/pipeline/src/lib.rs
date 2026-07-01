@@ -10,6 +10,8 @@ use ibrief_llm::{Completion, LanguageModel};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+pub mod topics;
+
 const ENRICH_SYSTEM: &str =
     "Du bist ein präziser Redaktions-Assistent. Antworte ausschließlich mit JSON.";
 
@@ -78,7 +80,9 @@ pub async fn enrich(
     for (i, out) in outcomes {
         if let Some(out) = out {
             items[i].summary = Some(out.summary);
-            items[i].topics = out.topics;
+            // Normalisierung aufs kanonische Vokabular (§T2.3) — Freiform-Tags würden
+            // die Bandit-Arme fragmentieren; Unbekanntes fällt heraus.
+            items[i].topics = topics::normalize_topics(&out.topics);
         }
     }
 
@@ -122,8 +126,11 @@ async fn enrich_one(item: &ContentItem, model: &dyn LanguageModel) -> Result<Enr
     let context = item.raw_summary.clone().unwrap_or_default();
     let prompt = format!(
         "Titel: {}\nText: {}\n\nGib JSON zurück mit den Feldern \"summary\" \
-(ein prägnanter Satz auf Deutsch) und \"topics\" (max. 3 Schlagworte). Nur JSON.",
-        item.title, context
+(ein prägnanter Satz auf Deutsch) und \"topics\" (1-3 Themen, AUSSCHLIESSLICH aus \
+dieser Liste: {}). Nur JSON.",
+        item.title,
+        context,
+        topics::vocabulary_list()
     );
     let req = Completion::new(prompt)
         .with_system(ENRICH_SYSTEM)
@@ -571,11 +578,13 @@ mod tests {
                 })
                 .collect();
 
-            // Mock: gibt für jedes Item eine Zusammenfassung + Topics zurück.
+            // Mock: gibt für jedes Item eine Zusammenfassung + Topics (kanonisches Vokabular,
+            // teils als Alias — Normalisierung §T2.3 muss beides auf gültige Arme mappen).
             let mut enrich_responses = Vec::new();
             for i in 0..12 {
+                let tag = if i % 2 == 0 { "ki" } else { "AI" };
                 enrich_responses.push(format!(
-                    r#"{{"summary":"Zusammenfassung von Artikel {i}.","topics":["thema{i}"]}}"#
+                    r#"{{"summary":"Zusammenfassung von Artikel {i}.","topics":["{tag}"]}}"#
                 ));
             }
             let enrich_model = ScriptedModel::new("enrich-mock", enrich_responses);
@@ -688,7 +697,7 @@ mod tests {
                 .collect();
 
             let enrich_responses: Vec<String> = (0..6)
-                .map(|i| format!(r#"{{"summary":"Zusammenfassung {i}.","topics":["t{i}"]}}"#))
+                .map(|i| format!(r#"{{"summary":"Zusammenfassung {i}.","topics":["llm"]}}"#))
                 .collect();
             let enrich_model = ScriptedModel::new("enrich", enrich_responses);
 
