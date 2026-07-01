@@ -13,9 +13,10 @@ use std::collections::{HashMap, HashSet};
 const ENRICH_SYSTEM: &str =
     "Du bist ein präziser Redaktions-Assistent. Antworte ausschließlich mit JSON.";
 
-/// Enrich liefert nur einen Satz + max. 3 Tags — Obergrenze gegen ausuferndes Generieren
-/// (großzügig, damit das JSON nie mitten im Objekt abgeschnitten wird und unparsebar wird).
-const ENRICH_MAX_TOKENS: u32 = 200;
+/// Enrich liefert nur einen Satz + max. 3 Tags — Obergrenze gegen ausuferndes Generieren.
+/// Mit `format:"json"` (kompakte Ausgabe, kein Reasoning) reichen wenige Dutzend Tokens;
+/// großzügig gewählt, damit das JSON nie mitten im Objekt abgeschnitten wird.
+const ENRICH_MAX_TOKENS: u32 = 256;
 /// Synthese (TL;DR: 3 Bullets · Gegenperspektive: 2-3 Sätze) — deckelt den Generierungs-Schwanz.
 const SYNTH_MAX_TOKENS: u32 = 400;
 /// Harte Obergrenze je Enrich-Item — ein einzelnes hängendes Item blockiert die Charge nicht
@@ -106,7 +107,8 @@ async fn enrich_one(item: &ContentItem, model: &dyn LanguageModel) -> Result<Enr
     let req = Completion::new(prompt)
         .with_system(ENRICH_SYSTEM)
         .temperature(0.3)
-        .max_tokens(ENRICH_MAX_TOKENS);
+        .max_tokens(ENRICH_MAX_TOKENS)
+        .json();
     let t0 = std::time::Instant::now();
     let raw = model.complete(&req).await?;
     tracing::debug!(

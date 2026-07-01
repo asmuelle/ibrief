@@ -54,6 +54,9 @@ pub struct Completion {
     /// Obergrenze der zu generierenden Tokens (Ollama: `num_predict`). `None` = Modell-Default.
     /// Deckelt ausuferndes Generieren — der größte Einzel-Hebel gegen die Enrich-Latenz.
     pub max_tokens: Option<u32>,
+    /// Erzwingt strukturierte JSON-Ausgabe (Ollama: `format:"json"`). Liefert kompaktes,
+    /// gültiges JSON ohne ```-Fence und ohne Reasoning-Vorspann — robust gegen Parse-Fehler.
+    pub format_json: bool,
 }
 
 impl Completion {
@@ -63,6 +66,7 @@ impl Completion {
             prompt: prompt.into(),
             temperature: 0.4,
             max_tokens: None,
+            format_json: false,
         }
     }
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -76,6 +80,11 @@ impl Completion {
     /// Setzt die Token-Obergrenze der Antwort (Ollama: `num_predict`).
     pub fn max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = Some(n);
+        self
+    }
+    /// Erzwingt gültiges JSON als Ausgabe (Ollama: `format:"json"`).
+    pub fn json(mut self) -> Self {
+        self.format_json = true;
         self
     }
 }
@@ -109,6 +118,7 @@ pub struct OllamaClient {
     label: String,
     keep_alive: String,
     num_ctx: u32,
+    think: Option<bool>,
     http: reqwest::Client,
 }
 
@@ -126,6 +136,10 @@ impl OllamaClient {
             model,
             keep_alive: DEFAULT_KEEP_ALIVE.to_string(),
             num_ctx: DEFAULT_NUM_CTX,
+            // Reasoning-Modelle (z.B. gemma4) verbrauchen sonst das Token-Budget mit verstecktem
+            // Denken (leere/abgeschnittene Antwort). ibrief braucht die Gedankenkette nicht →
+            // standardmäßig aus. Bei Nicht-Reasoning-Modellen ignoriert Ollama das Feld.
+            think: Some(false),
             http,
         }
     }
@@ -141,6 +155,12 @@ impl OllamaClient {
         self.num_ctx = num_ctx;
         self
     }
+
+    /// Steuert das Reasoning (`think`). `None` = Feld weglassen (Modell-Default).
+    pub fn with_think(mut self, think: Option<bool>) -> Self {
+        self.think = think;
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -149,6 +169,10 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
     keep_alive: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
     options: ChatOptions,
 }
 
@@ -196,6 +220,8 @@ impl LanguageModel for OllamaClient {
             messages,
             stream: false,
             keep_alive: self.keep_alive.as_str(),
+            format: if req.format_json { Some("json") } else { None },
+            think: self.think,
             options: ChatOptions {
                 temperature: req.temperature,
                 num_ctx: self.num_ctx,
