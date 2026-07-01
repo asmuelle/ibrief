@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use ibrief_core::FeedbackKind;
 use ibrief_eval::{EvalWeights, RUBRIC_VERSION, bakeoff::Candidate};
 use ibrief_ingest::Source;
-use ibrief_llm::{ClaudeCodeModel, LanguageModel, OllamaClient};
+use ibrief_llm::{ClaudeCodeModel, Embedder, LanguageModel, OllamaClient, OllamaEmbedder};
 use ibrief_store::{BenchRunRow, EvalRow, Store};
 use ibrief_telegram::Telegram;
 use serde::Deserialize;
@@ -63,6 +63,9 @@ struct LlmConfig {
     ollama_url: String,
     enrich_model: String,
     synth_model: String,
+    /// Embedding-Modell für semantische Dedup/Diversität (§T2.2). Leer = Feature aus.
+    #[serde(default)]
+    embed_model: String,
     max_items_enrich: usize,
     top_n: usize,
     /// Quellen mit `quality` unter diesem Wert werden nicht kuratiert (0.0 = Filter aus).
@@ -209,6 +212,14 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
         profile.llm.ollama_url.clone(),
         profile.llm.synth_model.clone(),
     );
+    // Embedder ist optional (leerer Modellname = aus) und sein Ausfall nie fatal —
+    // assemble_briefing degradiert dann auf URL-Dedup/Quellen-Diversität.
+    let embedder = (!profile.llm.embed_model.is_empty()).then(|| {
+        OllamaEmbedder::new(
+            profile.llm.ollama_url.clone(),
+            profile.llm.embed_model.clone(),
+        )
+    });
     let tldr_prompt = ibrief_optimize::active_tldr(&store).await?;
     tracing::info!(prompt = %tldr_prompt.version, "aktiver TL;DR-Prompt");
 
@@ -224,8 +235,11 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     let briefing = ibrief_pipeline::assemble_briefing(
         fresh,
         &cfg,
-        &enrich_model,
-        &synth_model,
+        &ibrief_pipeline::Models {
+            enrich: &enrich_model,
+            synth: &synth_model,
+            embedder: embedder.as_ref().map(|e| e as &dyn Embedder),
+        },
         &tldr_prompt.template,
         today(),
         &opts,

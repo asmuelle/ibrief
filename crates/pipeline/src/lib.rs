@@ -6,10 +6,11 @@
 use anyhow::Result;
 use futures::StreamExt;
 use ibrief_core::{Briefing, BriefingSection, Config, ContentItem};
-use ibrief_llm::{Completion, LanguageModel};
+use ibrief_llm::{Completion, Embedder, LanguageModel};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+pub mod semantic;
 pub mod topics;
 
 const ENRICH_SYSTEM: &str =
@@ -193,10 +194,17 @@ pub fn rank(mut items: Vec<ContentItem>, cfg: &Config) -> Vec<ContentItem> {
 }
 
 /// CURATE: Top-N der bereits gerankten Items in eine Sektion legen — mit Quellen-Limit
-/// gegen Monokultur. `max_per_source` begrenzt, wie viele Items eine einzelne Quelle
-/// stellen darf. Bleiben danach Plätze frei (zu wenig Vielfalt vorhanden), werden sie
+/// gegen Monokultur und semantischer Diversitäts-Kappe (§T2.2) gegen thematische Doppel.
+/// `max_per_source` begrenzt, wie viele Items eine einzelne Quelle stellen darf;
+/// `max_similarity` schiebt Items, die einem bereits gewählten zu ähnlich sind, in den
+/// Overflow. Bleiben danach Plätze frei (zu wenig Vielfalt vorhanden), werden sie
 /// in Rangfolge mit den besten verbleibenden Items aufgefüllt, statt das Briefing zu kürzen.
-pub fn curate(items: Vec<ContentItem>, top_n: usize, max_per_source: usize) -> Briefing {
+pub fn curate(
+    items: Vec<ContentItem>,
+    top_n: usize,
+    max_per_source: usize,
+    max_similarity: f64,
+) -> Briefing {
     let cap = max_per_source.max(1);
     let mut per_source: HashMap<String, usize> = HashMap::new();
     let mut picked: Vec<ContentItem> = Vec::with_capacity(top_n);
@@ -207,7 +215,7 @@ pub fn curate(items: Vec<ContentItem>, top_n: usize, max_per_source: usize) -> B
             break;
         }
         let count = per_source.entry(it.source_id.clone()).or_default();
-        if *count < cap {
+        if *count < cap && !semantic::too_similar(&it, &picked, max_similarity) {
             *count += 1;
             picked.push(it);
         } else {
@@ -374,32 +382,77 @@ pub struct AssembleOpts {
     pub max_per_source: usize,
 }
 
+/// Die injizierten Modelle der Kern-Pipeline (§T1.6/§T2.2). `embedder = None` schaltet
+/// semantische Dedup/Diversität ab — die Pipeline verhält sich dann wie vor T2.2.
+pub struct Models<'a> {
+    pub enrich: &'a dyn LanguageModel,
+    pub synth: &'a dyn LanguageModel,
+    pub embedder: Option<&'a dyn Embedder>,
+}
+
 /// Baut aus geholten Items ein fertiges Briefing:
-/// SCORE → ENRICH(Top-Kandidaten) → RE-RANK → CURATE → SYNTHESE(TL;DR ∥ Gegenperspektive)
-/// → WILDCARD. Die reine, testbare Kern-Pipeline OHNE Ingest/Persistenz — die Modelle werden
-/// injiziert (`&dyn LanguageModel`), sodass der Pfad mit einem Fake-Modell end-to-end
-/// getestet werden kann (§T1.6). Persistenz und „gesehen"-Markierung bleiben beim Aufrufer.
+/// SCORE → EMBED+DEDUP(semantisch) → ENRICH(Top-Kandidaten) → RE-RANK → CURATE →
+/// SYNTHESE(TL;DR ∥ Gegenperspektive) → WILDCARD. Die reine, testbare Kern-Pipeline OHNE
+/// Ingest/Persistenz — Modelle und Embedder werden injiziert, sodass der Pfad mit Fakes
+/// end-to-end getestet werden kann (§T1.6). `embedder = None` ⇒ Verhalten ohne Semantik.
+/// Persistenz und „gesehen"-Markierung bleiben beim Aufrufer.
 pub async fn assemble_briefing(
     fetched: Vec<ContentItem>,
     cfg: &Config,
-    enrich_model: &dyn LanguageModel,
-    synth_model: &dyn LanguageModel,
+    models: &Models<'_>,
     tldr_template: &str,
     date: String,
     opts: &AssembleOpts,
 ) -> Briefing {
+    let enrich_model = models.enrich;
+    let synth_model = models.synth;
+    let embedder = models.embedder;
     // SCORE zuerst, dann nur die Kandidaten anreichern, die auch kuratiert werden.
     let pre_ranked = rank(fetched, cfg);
     let candidate_n = opts.max_items_enrich.max(opts.top_n);
-    let candidates: Vec<_> = pre_ranked.into_iter().take(candidate_n).collect();
+
+    // EMBED (§T2.2): Fenster = doppelte Kandidatenmenge, damit nach dem Dubletten-Kollaps
+    // genug Nachrücker bleiben. Ausfall des Embedders ist nie fatal — dann degradieren
+    // Dedup/Diversität auf URL- bzw. Quellen-Ebene (Embeddings bleiben None).
+    let window_n = (candidate_n * 2).min(pre_ranked.len());
+    let mut window: Vec<_> = pre_ranked.into_iter().take(window_n).collect();
+    if let Some(emb) = embedder {
+        let texts: Vec<String> = window.iter().map(semantic::embed_text).collect();
+        let t0 = std::time::Instant::now();
+        match emb.embed(&texts).await {
+            Ok(vecs) => {
+                for (it, v) in window.iter_mut().zip(vecs) {
+                    it.embedding = Some(v);
+                }
+                tracing::info!(
+                    model = emb.label(),
+                    items = window.len(),
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    "EMBED"
+                );
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Embedding fehlgeschlagen — semantische Dedup/Diversität entfallen für diesen Lauf"
+            ),
+        }
+    }
+    let window = semantic::collapse_near_duplicates(window, semantic::DEDUP_SIMILARITY);
+
+    let candidates: Vec<_> = window.into_iter().take(candidate_n).collect();
     let n_cand = candidates.len();
     tracing::info!(model = enrich_model.label(), candidates = n_cand, "ENRICH");
     let enriched = enrich(candidates, enrich_model, n_cand).await;
 
-    // RE-RANK (jetzt mit Topics) → Wildcard + quellen-diverse Kuration.
+    // RE-RANK (jetzt mit Topics) → Wildcard + quellen- und themen-diverse Kuration.
     let ranked = rank(enriched, cfg);
     let wildcard = pick_wildcard(&ranked, opts.top_n);
-    let mut briefing = curate(ranked, opts.top_n, opts.max_per_source);
+    let mut briefing = curate(
+        ranked,
+        opts.top_n,
+        opts.max_per_source,
+        semantic::DIVERSITY_SIMILARITY,
+    );
     briefing.date = date;
 
     // SYNTHESE: TL;DR und Gegenperspektive sind unabhängig (Counterpoint liest das TL;DR
@@ -502,7 +555,7 @@ mod tests {
             item("6", "b"),
             item("7", "b"),
         ];
-        let b = curate(items, 4, 2);
+        let b = curate(items, 4, 2, semantic::DIVERSITY_SIMILARITY);
         let picked = &b.sections[0].items;
         assert_eq!(picked.len(), 4);
         assert_eq!(picked.iter().filter(|i| i.source_id == "a").count(), 2);
@@ -518,7 +571,7 @@ mod tests {
             item("3", "a"),
             item("4", "a"),
         ];
-        let b = curate(items, 4, 2);
+        let b = curate(items, 4, 2, semantic::DIVERSITY_SIMILARITY);
         assert_eq!(b.sections[0].items.len(), 4);
     }
 
@@ -611,7 +664,7 @@ mod tests {
             // SCORE → CURATE
             let cfg = Config::default();
             let ranked = rank(enriched, &cfg);
-            let mut briefing = curate(ranked, 8, 3);
+            let mut briefing = curate(ranked, 8, 3, semantic::DIVERSITY_SIMILARITY);
             briefing.date = "2026-06-29".into();
 
             // TL;DR
@@ -716,8 +769,11 @@ mod tests {
             let briefing = assemble_briefing(
                 items,
                 &cfg,
-                &enrich_model,
-                &synth_model,
+                &Models {
+                    enrich: &enrich_model,
+                    synth: &synth_model,
+                    embedder: None,
+                },
                 "Fasse zusammen:\n{items}",
                 "2026-07-01".into(),
                 &opts,
@@ -736,6 +792,94 @@ mod tests {
             // Anti-Blase-Sektionen: Gegenperspektive + Wildcard (6 Items > top_n=4 → Wildcard da).
             assert!(briefing.sections.iter().any(|s| s.id == "counterpoint"));
             assert!(briefing.sections.iter().any(|s| s.id == "wildcard"));
+        }
+
+        /// Fake-Embedder: liefert vorgegebene Vektoren in Textreihenfolge.
+        struct ScriptedEmbedder(Vec<Vec<f32>>);
+
+        #[async_trait]
+        impl ibrief_llm::Embedder for ScriptedEmbedder {
+            async fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, ibrief_llm::ModelError> {
+                assert_eq!(texts.len(), self.0.len(), "Embedder-Skript passt nicht");
+                Ok(self.0.clone())
+            }
+            fn label(&self) -> &str {
+                "embed-mock"
+            }
+        }
+
+        #[tokio::test]
+        async fn assemble_briefing_collapses_cross_source_duplicates() {
+            // Dieselbe Story von "verge" und "hn" (quasi-identische Embeddings) + zwei
+            // eigenständige Stories. Erwartung: die Dublette verschwindet VOR dem Enrich,
+            // das rangniedrigere Doppel ("hn"-Kopie) taucht nirgends im Briefing auf.
+            let mk = |id: &str, src: &str, text: &str| ContentItem {
+                id: id.into(),
+                source_id: src.into(),
+                title: text.into(),
+                url: format!("https://{src}.com/{id}"),
+                published_at: None,
+                raw_summary: Some(text.into()),
+                summary: None,
+                topics: vec![],
+                entities: vec![],
+                embedding: None,
+            };
+            let items = vec![
+                mk("story-a", "verge", "GPT-7 vorgestellt"),
+                mk("story-a-kopie", "hn", "GPT-7 vorgestellt (Diskussion)"),
+                mk("story-b", "verge", "Rust 2.0 Release"),
+                mk("story-c", "ars", "Neues Fusionsexperiment"),
+            ];
+            let embedder = ScriptedEmbedder(vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.999, 0.04, 0.0], // Quasi-Dublette von story-a
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ]);
+
+            // 3 Enrich-Antworten — genau die Überlebenden des Kollaps.
+            let enrich_model = ScriptedModel::new(
+                "enrich",
+                (0..3)
+                    .map(|i| format!(r#"{{"summary":"Zusammenfassung {i}.","topics":["ki"]}}"#))
+                    .collect(),
+            );
+            let bullets = "- Erste Sache\n- Zweite Sache\n- Dritte Sache".to_string();
+            let synth_model = ScriptedModel::new("synth", vec![bullets.clone(), bullets]);
+
+            let briefing = assemble_briefing(
+                items,
+                &Config::default(),
+                &Models {
+                    enrich: &enrich_model,
+                    synth: &synth_model,
+                    embedder: Some(&embedder),
+                },
+                "Fasse zusammen:\n{items}",
+                "2026-07-01".into(),
+                &AssembleOpts {
+                    max_items_enrich: 2,
+                    top_n: 2,
+                    max_per_source: 2,
+                },
+            )
+            .await;
+
+            let all_ids: Vec<&str> = briefing
+                .sections
+                .iter()
+                .flat_map(|s| s.items.iter())
+                .map(|it| it.id.as_str())
+                .collect();
+            assert!(
+                !all_ids.contains(&"story-a-kopie"),
+                "Cross-Source-Dublette hätte kollabieren müssen: {all_ids:?}"
+            );
+            assert!(all_ids.contains(&"story-a"));
         }
 
         #[tokio::test]

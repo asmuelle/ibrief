@@ -261,6 +261,109 @@ impl LanguageModel for OllamaClient {
 }
 
 // ---------------------------------------------------------------------------
+// Embeddings (lokal via Ollama /api/embed) — §T2.2
+// ---------------------------------------------------------------------------
+
+/// Gemeinsame Schnittstelle für Embedding-Backends. Die Pipeline nutzt Embeddings für
+/// semantische Dedup und Diversität — Ausfall ist nie fatal (Feature degradiert sauber).
+#[async_trait]
+pub trait Embedder: Send + Sync {
+    /// Liefert je Eingabetext einen Embedding-Vektor (gleiche Reihenfolge wie `texts`).
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ModelError>;
+    fn label(&self) -> &str;
+}
+
+/// Timeout für einen Embed-Batch. nomic-embed ist winzig (~274 MB), aber der Batch kann
+/// ~40 Texte umfassen und das Modell muss ggf. erst laden.
+const EMBED_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub struct OllamaEmbedder {
+    base_url: String,
+    model: String,
+    label: String,
+    keep_alive: String,
+    http: reqwest::Client,
+}
+
+impl OllamaEmbedder {
+    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(EMBED_REQUEST_TIMEOUT)
+            .build()
+            .expect("reqwest-Client bauen (nur TLS-Init kann scheitern)");
+        Self {
+            base_url: base_url.into(),
+            label: format!("ollama-embed:{model}"),
+            model,
+            keep_alive: DEFAULT_KEEP_ALIVE.to_string(),
+            http,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EmbedRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+    keep_alive: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbedResponse {
+    embeddings: Vec<Vec<f32>>,
+}
+
+#[async_trait]
+impl Embedder for OllamaEmbedder {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ModelError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = EmbedRequest {
+            model: self.model.as_str(),
+            input: texts,
+            keep_alive: self.keep_alive.as_str(),
+        };
+        let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
+        let resp = self.http.post(&url).json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ModelError::Timeout(EMBED_REQUEST_TIMEOUT)
+            } else {
+                ModelError::Unreachable(format!("{url}: {e}"))
+            }
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ModelError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let parsed: EmbedResponse = resp
+            .json()
+            .await
+            .map_err(|e| ModelError::Decode(e.to_string()))?;
+        if parsed.embeddings.len() != texts.len() {
+            return Err(ModelError::Decode(format!(
+                "erwartete {} Embeddings, bekam {}",
+                texts.len(),
+                parsed.embeddings.len()
+            )));
+        }
+        Ok(parsed.embeddings)
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Claude Code (Abo-basiert) — für periodische Kalibrierung des lokalen Judge.
 //
 // Ruft die Claude-Code-CLI im Headless-Modus auf:

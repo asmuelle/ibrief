@@ -10,6 +10,9 @@ ollama_url = "http://localhost:11434"
 enrich_model = "gemma4:26b"
 # Synthese-Tier: stark, für TL;DR / Kuratierung (später auch Judge)
 synth_model = "gemma4:31b"
+# Embedding-Tier: semantische Cross-Source-Dedup + Diversitäts-Kappe in der Kuration.
+# Leer lassen = Feature aus (Pipeline degradiert auf URL-Dedup/Quellen-Diversität).
+embed_model = "nomic-embed-text:latest"
 max_items_enrich = 15
 top_n = 8
 # Quellen mit quality < diesem Wert werden nicht kuratiert (0.0 = aus). Seed-Qualität ist 0.5;
