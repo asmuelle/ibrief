@@ -3,6 +3,9 @@
 //! Befehle:
 //!   ibrief [brief] [--force]  Ingest → Dedup → Score → Enrich(Top-Kandidaten) → Curate → Render → Persist → (Push)
 //!                             `--force`: Cross-Day-Dedup überspringen, heutiges Briefing neu aufbauen
+//!   ibrief daily [weekly]     Unbeaufsichtigter Tageslauf: brief → eval → learn → learn check;
+//!                             montags (oder mit `weekly`) zusätzlich optimize + sources evolve.
+//!                             Stages sind fehlerisoliert; Fehler ⇒ Exit ≠ 0 (launchd-sichtbar)
 //!   ibrief feedback           Telegram-Feedback-Loop: Button-Klicks → Store
 //!   ibrief feedback list [datum]              Items des Briefings mit Position anzeigen
 //!   ibrief feedback add <pos> <art> [datum]   Feedback ohne Telegram (art: up|down|more|less|open)
@@ -123,6 +126,7 @@ async fn main() -> Result<()> {
 
     match command.as_str() {
         "brief" => run_brief(cfg_dir, &profile, &rest).await,
+        "daily" => run_daily(cfg_dir, &profile, &rest).await,
         "feedback" => run_feedback(&profile, &rest).await,
         "eval" => run_eval(&profile, &rest).await,
         "bench" => run_bench(&profile, &rest).await,
@@ -133,7 +137,7 @@ async fn main() -> Result<()> {
         "sources" => run_sources(cfg_dir, &profile, &rest).await,
         "research" => run_research(&profile, &rest).await,
         other => anyhow::bail!(
-            "unbekannter Befehl '{other}' (erwartet: brief | feedback | eval | bench | learn | config | optimize | experiment | sources | research)"
+            "unbekannter Befehl '{other}' (erwartet: brief | daily | feedback | eval | bench | learn | config | optimize | experiment | sources | research)"
         ),
     }
 }
@@ -299,6 +303,53 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
 
     println!("{md}");
     Ok(())
+}
+
+/// Der unbeaufsichtigte Tageslauf (§T2.7): der Selbstverbesserungs-Loop als EIN Befehl.
+/// brief → eval → learn → learn check (äußerer Demotions-Loop); montags oder mit `weekly`
+/// zusätzlich optimize (Prompt-Schatten-Test) + sources evolve (Registry + Drift-Wächter).
+/// Jede Stage ist fehlerisoliert: ein Ausfall (z.B. Ollama weg) bricht den Lauf nicht ab,
+/// aber der Exit-Code ≠ 0 macht ihn im launchd-Log sichtbar.
+async fn run_daily(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    use chrono::Datelike;
+    let weekly = rest.iter().any(|a| a == "weekly" || a == "--weekly")
+        || chrono::Utc::now().weekday() == chrono::Weekday::Mon;
+    tracing::info!(weekly, "DAILY-Lauf startet");
+    let t0 = Instant::now();
+
+    let mut failures: Vec<&'static str> = Vec::new();
+    let mut note = |name: &'static str, res: Result<()>| {
+        if let Err(e) = res {
+            tracing::error!(stage = name, error = %e, "Stage fehlgeschlagen — Lauf geht weiter");
+            failures.push(name);
+        }
+    };
+
+    note("brief", run_brief(cfg_dir, profile, &[]).await);
+    note("eval", run_eval(profile, &[]).await);
+    note("learn", run_learn(profile, &[]).await);
+    note(
+        "learn-check",
+        run_learn(profile, &["check".to_string()]).await,
+    );
+    if weekly {
+        note("optimize", run_optimize(profile, &[]).await);
+        note(
+            "sources-evolve",
+            run_sources(cfg_dir, profile, &["evolve".to_string()]).await,
+        );
+    }
+
+    let elapsed_s = t0.elapsed().as_secs();
+    if failures.is_empty() {
+        tracing::info!(elapsed_s, weekly, "DAILY-Lauf komplett");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "daily nach {elapsed_s}s mit Fehlern in: {} (Details im Log)",
+            failures.join(", ")
+        )
+    }
 }
 
 async fn run_feedback(profile: &ProfileFile, rest: &[String]) -> Result<()> {

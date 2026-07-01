@@ -1,5 +1,6 @@
 /target
 /out
+/logs
 *.log
 
 # Lokale SQLite-Datenbank (Runtime-Artefakt, siehe config/profile.toml → store.path)

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    ibrief Daily-Job (§T2.7): startet den Selbstverbesserungs-Loop jeden Morgen 06:30.
+
+    NICHT direkt nach ~/Library/LaunchAgents kopieren — `just launchd-install` ersetzt
+    __IBRIEF_DIR__ durch den Projektpfad, baut das Release-Binary und lädt den Job.
+
+    Telegram-Push: Token gehört NIE in diese Datei. Entweder telegram.enabled=false lassen,
+    oder das Token via `launchctl setenv IBRIEF_TELEGRAM_TOKEN ...` bereitstellen.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ibrief.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__IBRIEF_DIR__/target/release/ibrief</string>
+        <string>daily</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__IBRIEF_DIR__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__IBRIEF_DIR__/logs/daily.log</string>
+    <key>StandardErrorPath</key>
+    <string>__IBRIEF_DIR__/logs/daily.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <!-- Nachholen, wenn der Mac um 06:30 schlief: launchd feuert beim Aufwachen. -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -52,6 +52,38 @@ clean:
 brief:
     {{run}} brief
 
+# Unbeaufsichtigter Tageslauf: brief → eval → learn → learn check (+ montags weekly-Teil).
+daily:
+    {{run}} daily
+
+# Wochenteil erzwingen (optimize + sources evolve), unabhängig vom Wochentag.
+daily-weekly:
+    {{run}} daily weekly
+
+# Äußerer Eval-Loop einzeln: aktive Config vs. Parent (Demotion bei Verschlechterung).
+learn-check:
+    {{run}} learn check
+
+# --- Scheduling (launchd, macOS) --------------------------------------------
+
+# Daily-Job installieren: Release-Binary bauen, Plist mit Projektpfad füllen, laden (06:30).
+launchd-install: build
+    mkdir -p "{{justfile_directory()}}/logs" ~/Library/LaunchAgents
+    sed "s|__IBRIEF_DIR__|{{justfile_directory()}}|g" ops/com.ibrief.daily.plist > ~/Library/LaunchAgents/com.ibrief.daily.plist
+    launchctl unload ~/Library/LaunchAgents/com.ibrief.daily.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.ibrief.daily.plist
+    @echo "✓ com.ibrief.daily geladen — täglich 06:30, Logs unter logs/daily*.log"
+
+# Daily-Job entladen und Plist entfernen.
+launchd-uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.ibrief.daily.plist 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.ibrief.daily.plist
+    @echo "✓ com.ibrief.daily entfernt"
+
+# Status des Daily-Jobs anzeigen.
+launchd-status:
+    @launchctl list | grep com.ibrief || echo "com.ibrief.daily nicht geladen"
+
 # Telegram-Feedback-Loop starten (braucht IBRIEF_TELEGRAM_TOKEN).
 feedback:
     {{run}} feedback
