@@ -209,7 +209,17 @@ pub async fn run_enrich(
             }
         }
 
-        let avg = |sum: f64| if n > 0 { sum / n as f64 } else { 0.0 };
+        // §T1.5: Ein Kandidat ohne EINE bewertbare Zusammenfassung wird NICHT als Qualität 0.0
+        // gewertet (das würde einen transienten Ausfall wie ein wirklich schlechtes Modell ganz
+        // nach unten sortieren) — er fällt aus dem Ranking, mit klarem Log.
+        if n == 0 {
+            tracing::warn!(
+                model = cand.model.label(),
+                "enrich-bakeoff: keine Zusammenfassung bewertbar (Modell/Judge nicht verfügbar?) — Kandidat ausgeschlossen, NICHT als 0.0 gewertet"
+            );
+            continue;
+        }
+        let avg = |sum: f64| sum / n as f64;
         entries.push(EnrichEntry {
             name: cand.name.clone(),
             model_label: cand.model.label().to_string(),
@@ -283,7 +293,7 @@ mod tests {
 
     #[async_trait]
     impl LanguageModel for Scripted {
-        async fn complete(&self, _req: &Completion) -> anyhow::Result<String> {
+        async fn complete(&self, _req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             Ok(self.out.clone())
         }
         fn label(&self) -> &str {
@@ -296,7 +306,7 @@ mod tests {
 
     #[async_trait]
     impl LanguageModel for MarkerJudge {
-        async fn complete(&self, req: &Completion) -> anyhow::Result<String> {
+        async fn complete(&self, req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             let score = if req.prompt.contains("WIN") { 0.9 } else { 0.2 };
             Ok(format!("{{\"overall\":{score},\"comment\":\"t\"}}"))
         }
@@ -411,7 +421,7 @@ mod tests {
 
     #[async_trait]
     impl LanguageModel for FixedEnrichJudge {
-        async fn complete(&self, _req: &Completion) -> anyhow::Result<String> {
+        async fn complete(&self, _req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             Ok(r#"{"faithfulness":0.9,"concision":0.8,"tags":0.7,"overall":0.85}"#.into())
         }
         fn label(&self) -> &str {
@@ -424,7 +434,7 @@ mod tests {
 
     #[async_trait]
     impl LanguageModel for MarkerEnrichJudge {
-        async fn complete(&self, req: &Completion) -> anyhow::Result<String> {
+        async fn complete(&self, req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             let s = if req.prompt.contains("GUT") { 0.9 } else { 0.2 };
             Ok(format!(
                 "{{\"faithfulness\":{s},\"concision\":{s},\"tags\":{s},\"overall\":{s}}}"

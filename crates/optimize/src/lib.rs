@@ -239,7 +239,7 @@ mod tests {
     struct MarkerSynth;
     #[async_trait]
     impl LanguageModel for MarkerSynth {
-        async fn complete(&self, req: &Completion) -> Result<String> {
+        async fn complete(&self, req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             if req.prompt.contains("BETTER") {
                 Ok("candidate tldr".into())
             } else {
@@ -255,7 +255,7 @@ mod tests {
     struct MarkerJudge;
     #[async_trait]
     impl LanguageModel for MarkerJudge {
-        async fn complete(&self, req: &Completion) -> Result<String> {
+        async fn complete(&self, req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             let overall = if req.prompt.contains("candidate") {
                 0.9
             } else {

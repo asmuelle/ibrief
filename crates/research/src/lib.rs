@@ -273,7 +273,7 @@ mod tests {
     struct MockModel;
     #[async_trait]
     impl LanguageModel for MockModel {
-        async fn complete(&self, req: &Completion) -> Result<String> {
+        async fn complete(&self, req: &Completion) -> Result<String, ibrief_llm::ModelError> {
             if req.prompt.contains("Folge-Suchanfrage") {
                 Ok("DONE".into()) // reflect → fertig nach erster Runde
             } else {

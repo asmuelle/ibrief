@@ -440,12 +440,12 @@ mod tests {
 
         #[async_trait]
         impl LanguageModel for ScriptedModel {
-            async fn complete(&self, _req: &Completion) -> anyhow::Result<String> {
+            async fn complete(&self, _req: &Completion) -> Result<String, ibrief_llm::ModelError> {
                 self.lines
                     .lock()
                     .unwrap()
                     .pop()
-                    .ok_or_else(|| anyhow::anyhow!("mock exhausted"))
+                    .ok_or_else(|| ibrief_llm::ModelError::Other("mock exhausted".into()))
             }
             fn label(&self) -> &str {
                 &self.label

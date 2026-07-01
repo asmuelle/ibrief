@@ -5,10 +5,45 @@
 //!
 //! Weitere Backends (Codex-CLI, direkte API) implementieren einfach [`LanguageModel`].
 
-use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+/// Typisierter Fehler an der Modell-Grenze. Trennt Infrastruktur-Fehler (Backend down,
+/// Timeout, 5xx) von inhaltlichen (Decode) — damit z.B. der Bakeoff einen Ausfall NICHT
+/// als Qualität 0.0 wertet (§T1.5). Implementiert `std::error::Error`, sodass Aufrufer in
+/// `anyhow`-Kontexten weiterhin einfach `?` verwenden können.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    /// Backend nicht erreichbar (Verbindungsaufbau/DNS/Refused, Prozess nicht startbar).
+    #[error("Modell-Backend nicht erreichbar: {0}")]
+    Unreachable(String),
+    /// Zeitüberschreitung der Anfrage.
+    #[error("Zeitüberschreitung nach {0:?}")]
+    Timeout(Duration),
+    /// Backend antwortete mit Fehlerstatus.
+    #[error("Backend-Fehlerstatus {status}: {body}")]
+    Status { status: u16, body: String },
+    /// Antwort ließ sich nicht dekodieren/parsen.
+    #[error("Antwort dekodieren: {0}")]
+    Decode(String),
+    /// Sonstiger, aufrufer-/mock-definierter Fehler.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl ModelError {
+    /// True bei Infrastruktur-Fehlern (Backend down/Timeout/5xx) im Gegensatz zu inhaltlichen
+    /// Fehlern (Decode, 4xx). Ein transienter Ausfall ist damit von einem wirklich schlechten
+    /// Modell unterscheidbar (§T1.5).
+    pub fn is_infrastructure(&self) -> bool {
+        match self {
+            ModelError::Unreachable(_) | ModelError::Timeout(_) => true,
+            ModelError::Status { status, .. } => *status >= 500,
+            ModelError::Decode(_) | ModelError::Other(_) => false,
+        }
+    }
+}
 
 /// Eine Anfrage an ein Sprachmodell.
 #[derive(Debug, Clone)]
@@ -48,7 +83,7 @@ impl Completion {
 /// Gemeinsame Schnittstelle aller Modelle. Pipeline-Stages hängen nur hiervon ab.
 #[async_trait]
 pub trait LanguageModel: Send + Sync {
-    async fn complete(&self, req: &Completion) -> Result<String>;
+    async fn complete(&self, req: &Completion) -> Result<String, ModelError>;
     fn label(&self) -> &str;
 }
 
@@ -143,7 +178,7 @@ struct ChatResponseMessage {
 
 #[async_trait]
 impl LanguageModel for OllamaClient {
-    async fn complete(&self, req: &Completion) -> Result<String> {
+    async fn complete(&self, req: &Completion) -> Result<String, ModelError> {
         let mut messages = Vec::new();
         if let Some(sys) = &req.system {
             messages.push(ChatMessage {
@@ -170,17 +205,27 @@ impl LanguageModel for OllamaClient {
         };
 
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("Ollama-Request an {url} fehlgeschlagen"))?
-            .error_for_status()
-            .context("Ollama antwortete mit Fehlerstatus")?;
+        let resp = self.http.post(&url).json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ModelError::Timeout(DEFAULT_REQUEST_TIMEOUT)
+            } else {
+                ModelError::Unreachable(format!("{url}: {e}"))
+            }
+        })?;
 
-        let parsed: ChatResponse = resp.json().await.context("Ollama-Antwort dekodieren")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ModelError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let parsed: ChatResponse = resp
+            .json()
+            .await
+            .map_err(|e| ModelError::Decode(e.to_string()))?;
         Ok(parsed.message.content)
     }
 
@@ -225,7 +270,7 @@ struct ClaudeResult {
 
 #[async_trait]
 impl LanguageModel for ClaudeCodeModel {
-    async fn complete(&self, req: &Completion) -> Result<String> {
+    async fn complete(&self, req: &Completion) -> Result<String, ModelError> {
         // System- und User-Prompt zusammenführen (CLI hat kein separates System-Flag).
         let prompt = match &req.system {
             Some(sys) => format!("{sys}\n\n{}", req.prompt),
@@ -243,23 +288,21 @@ impl LanguageModel for ClaudeCodeModel {
 
         let out = tokio::time::timeout(self.timeout, cmd.output())
             .await
-            .with_context(|| {
-                format!(
-                    "`{}` (Claude Code CLI) timed out after {:?}",
-                    self.binary, self.timeout
-                )
-            })??;
+            .map_err(|_| ModelError::Timeout(self.timeout))?
+            .map_err(|e| {
+                ModelError::Unreachable(format!("`{}` nicht ausführbar: {e}", self.binary))
+            })?;
 
         if !out.status.success() {
-            anyhow::bail!(
+            return Err(ModelError::Other(format!(
                 "claude beendet mit {}: {}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
-            );
+            )));
         }
 
         let parsed: ClaudeResult = serde_json::from_slice(&out.stdout)
-            .context("`claude --output-format json` parsen (Feld `result`)")?;
+            .map_err(|e| ModelError::Decode(format!("`claude --output-format json`: {e}")))?;
         Ok(parsed.result)
     }
 
