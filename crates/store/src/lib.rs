@@ -212,6 +212,43 @@ pub struct Store {
     pool: SqlitePool,
 }
 
+/// Upsert eines Content-Items auf einer beliebigen Verbindung (Pool-Connection oder
+/// Transaktion) — damit `save_briefing` gezeigte Items atomar mitschreiben kann.
+async fn upsert_item_conn(conn: &mut sqlx::SqliteConnection, it: &ContentItem) -> Result<()> {
+    let topics = serde_json::to_string(&it.topics)?;
+    let entities = serde_json::to_string(&it.entities)?;
+    let embedding = it
+        .embedding
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let published = it.published_at.map(|d| d.to_rfc3339());
+    sqlx::query(
+        "INSERT INTO content_items
+            (id, source_id, title, url, published_at, raw_summary, summary, topics, entities, embedding, first_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+            summary = excluded.summary,
+            topics  = excluded.topics,
+            entities = excluded.entities,
+            embedding = excluded.embedding",
+    )
+    .bind(it.id.as_str())
+    .bind(it.source_id.as_str())
+    .bind(it.title.as_str())
+    .bind(it.url.as_str())
+    .bind(published)
+    .bind(it.raw_summary.as_deref())
+    .bind(it.summary.as_deref())
+    .bind(topics)
+    .bind(entities)
+    .bind(embedding)
+    .bind(now())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 impl Store {
     /// Öffnet (oder erstellt) die DB und legt das Schema an.
     pub async fn open(path: &str) -> Result<Self> {
@@ -268,48 +305,27 @@ impl Store {
 
     /// Fügt ein Item ein oder aktualisiert Summary/Topics (first_seen bleibt erhalten).
     pub async fn upsert_item(&self, it: &ContentItem) -> Result<()> {
-        let topics = serde_json::to_string(&it.topics)?;
-        let entities = serde_json::to_string(&it.entities)?;
-        let embedding = it
-            .embedding
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let published = it.published_at.map(|d| d.to_rfc3339());
-        sqlx::query(
-            "INSERT INTO content_items
-                (id, source_id, title, url, published_at, raw_summary, summary, topics, entities, embedding, first_seen)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                summary = excluded.summary,
-                topics  = excluded.topics,
-                entities = excluded.entities,
-                embedding = excluded.embedding",
-        )
-        .bind(it.id.as_str())
-        .bind(it.source_id.as_str())
-        .bind(it.title.as_str())
-        .bind(it.url.as_str())
-        .bind(published)
-        .bind(it.raw_summary.as_deref())
-        .bind(it.summary.as_deref())
-        .bind(topics)
-        .bind(entities)
-        .bind(embedding)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        upsert_item_conn(&mut conn, it).await
     }
 
     /// Speichert einen Briefing-Record samt gezeigter Items (globale Position für Button-Mapping).
     pub async fn save_briefing(&self, b: &Briefing, config_version: &str) -> Result<()> {
         let tldr = serde_json::to_string(&b.tldr)?;
 
-        // Atomar: Header, das Löschen alter Item-Zuordnungen und die neuen Items gehören in
-        // eine Transaktion. Ein Absturz mitten im ~30-min-Lauf darf keinen Header ohne (oder mit
-        // halben) Items hinterlassen, den Eval/Learn danach als echtes Briefing konsumieren.
+        // Atomar: der Content der gezeigten Items, der Header, das Löschen alter Item-
+        // Zuordnungen und die neuen Items gehören in EINE Transaktion. Ein Absturz mitten im
+        // ~30-min-Lauf darf weder ein Item als „gesehen" markieren noch einen Header ohne (oder
+        // mit halben) Items hinterlassen, den Eval/Learn danach als echtes Briefing konsumieren.
         let mut tx = self.pool.begin().await?;
+
+        // Gezeigte Items (angereichert: Summary/Counterpoint/Wildcard) mitschreiben, damit
+        // load_briefing sie später findet — und erst mit dem Commit als „gesehen" gelten.
+        for sec in &b.sections {
+            for it in &sec.items {
+                upsert_item_conn(&mut tx, it).await?;
+            }
+        }
 
         sqlx::query(
             "INSERT OR REPLACE INTO briefings (date, config_version, tldr, created_at)

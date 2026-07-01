@@ -185,21 +185,23 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
         "INGEST fertig (nach Dedup/Filter)"
     );
     if fresh.is_empty() {
-        tracing::warn!(
-            "keine neuen Items — nichts zu briefen (Tipp: `brief --force` baut heute neu)"
-        );
+        // Unterscheiden: heute schon gebrieft vs. tatsächlich nichts Neues (Recovery-Hinweis).
+        if store.load_briefing(&today()).await?.is_some() {
+            tracing::info!("keine neuen Items — Briefing für heute existiert bereits");
+        } else {
+            tracing::warn!(
+                "keine neuen Items — nichts zu briefen (Tipp: `brief --force` baut heute neu)"
+            );
+        }
         return Ok(());
     }
 
     // SCORE zuerst, dann nur die Kandidaten anreichern, die auch kuratiert werden.
     // (Sonst werden die ersten N in Fetch-Reihenfolge enriched, aber die aktuellsten gezeigt.)
     let cfg = ibrief_learn::load_active(&store).await?;
-    if !force {
-        // Neue Items als „gesehen" markieren (roh), damit sie nicht erneut auftauchen.
-        for it in &fresh {
-            store.upsert_item(it).await?;
-        }
-    }
+    // Alle geholten Items merken, um NICHT gezeigte erst NACH dem durablen save_briefing als
+    // „gesehen" zu markieren (Crash-Resumability §T1.2 — vorher wird nichts markiert).
+    let all_fetched = fresh.clone();
     let pre_ranked = ibrief_pipeline::rank(fresh, &cfg);
     let candidate_n = profile.llm.max_items_enrich.max(profile.llm.top_n);
     let candidates: Vec<_> = pre_ranked.into_iter().take(candidate_n).collect();
@@ -212,9 +214,8 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     let n_cand = candidates.len();
     tracing::info!(model = enrich_model.label(), candidates = n_cand, "ENRICH");
     let enriched = ibrief_pipeline::enrich(candidates, &enrich_model, n_cand).await;
-    for it in &enriched {
-        store.upsert_item(it).await?;
-    }
+    // Persistenz erst mit save_briefing: angereicherte, gezeigte Items werden dort atomar
+    // mitgeschrieben; nicht gezeigte werden nach dem Speichern als „gesehen" markiert.
 
     // RE-RANK (jetzt mit Topics) → Wildcard + quellen-diverse Kuration
     let ranked = ibrief_pipeline::rank(enriched, &cfg);
@@ -225,41 +226,42 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     let mut briefing = ibrief_pipeline::curate(ranked, profile.llm.top_n, max_per_source);
     briefing.date = today();
 
-    // TL;DR (Synthese-Tier, mit aktivem/gelerntem Prompt)
+    // SYNTHESE (Synthese-Tier): TL;DR und Gegenperspektive sind voneinander unabhängig
+    // (die Gegenperspektive liest das TL;DR nicht) → nebenläufig anstoßen. Der Wall-Clock-
+    // Gewinn hängt von OLLAMA_NUM_PARALLEL ab; bei num_parallel=1 serialisiert Ollama beide,
+    // dann bleibt es korrekt, nur ohne Overlap.
     let synth_model = OllamaClient::new(
         profile.llm.ollama_url.clone(),
         profile.llm.synth_model.clone(),
     );
     let tldr_prompt = ibrief_optimize::active_tldr(&store).await?;
-    tracing::info!(model = synth_model.label(), prompt = %tldr_prompt.version, "TL;DR");
-    // Erste Synth-Anfrage im Lauf: enthält ggf. das (einmalige) Laden des Synth-Modells.
-    let t_tldr = Instant::now();
-    match ibrief_pipeline::make_tldr(&briefing, &synth_model, &tldr_prompt.template).await {
+    tracing::info!(
+        model = synth_model.label(),
+        prompt = %tldr_prompt.version,
+        "SYNTHESE (TL;DR + Gegenperspektive, nebenläufig)"
+    );
+    let t_synth = Instant::now();
+    let (tldr_res, cp_res) = tokio::join!(
+        ibrief_pipeline::make_tldr(&briefing, &synth_model, &tldr_prompt.template),
+        ibrief_pipeline::make_counterpoint(&briefing, &synth_model, &briefing.date),
+    );
+    match tldr_res {
         Ok(tldr) => briefing.tldr = tldr,
         Err(e) => tracing::warn!(error = %e, "TL;DR-Erzeugung fehlgeschlagen, fahre ohne fort"),
     }
-    tracing::info!(
-        elapsed_ms = t_tldr.elapsed().as_millis() as u64,
-        "TL;DR fertig"
-    );
-
-    // GEGENPERSPEKTIVE (§3, nicht abschaltbar — Anti-Blase)
-    let t_cp = Instant::now();
-    match ibrief_pipeline::make_counterpoint(&briefing, &synth_model, &briefing.date).await {
-        Ok(Some(cp)) => {
-            store.upsert_item(&cp).await?; // persistieren, damit load_briefing es findet
-            briefing.sections.push(BriefingSection {
-                id: "counterpoint".into(),
-                title: "Gegenperspektive".into(),
-                items: vec![cp],
-            });
-        }
+    match cp_res {
+        // Persistenz erst mit save_briefing (Counterpoint ist Teil von briefing.sections).
+        Ok(Some(cp)) => briefing.sections.push(BriefingSection {
+            id: "counterpoint".into(),
+            title: "Gegenperspektive".into(),
+            items: vec![cp],
+        }),
         Ok(None) => tracing::warn!("Gegenperspektive leer — übersprungen"),
         Err(e) => tracing::warn!(error = %e, "Gegenperspektive fehlgeschlagen"),
     }
     tracing::info!(
-        elapsed_ms = t_cp.elapsed().as_millis() as u64,
-        "Gegenperspektive fertig"
+        elapsed_ms = t_synth.elapsed().as_millis() as u64,
+        "SYNTHESE fertig"
     );
 
     // WILDCARD (§3, nicht abschaltbar — bewusste Überraschung)
@@ -277,6 +279,24 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
         .await?
         .unwrap_or_else(|| "default".to_string());
     store.save_briefing(&briefing, &config_version).await?;
+
+    // Erst JETZT (Briefing durabel gespeichert) die geholten, aber NICHT gezeigten Items als
+    // „gesehen" markieren, damit sie nicht erneut auftauchen. Gezeigte Items hat save_briefing
+    // bereits atomar persistiert; --force baut heute bewusst neu und markiert nicht nach.
+    if !force {
+        let shown: std::collections::HashSet<&str> = briefing
+            .sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .map(|it| it.id.as_str())
+            .collect();
+        for it in all_fetched
+            .iter()
+            .filter(|it| !shown.contains(it.id.as_str()))
+        {
+            store.upsert_item(it).await?;
+        }
+    }
 
     // RENDER (Datei)
     let md = ibrief_pipeline::render(&briefing);

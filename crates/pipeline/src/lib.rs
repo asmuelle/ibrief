@@ -4,6 +4,7 @@
 //! TL;DR per Synthese-Modell. Alle LLM-Aufrufe laufen über das [`LanguageModel`]-Trait.
 
 use anyhow::Result;
+use futures::StreamExt;
 use ibrief_core::{Briefing, BriefingSection, Config, ContentItem};
 use ibrief_llm::{Completion, LanguageModel};
 use serde::Deserialize;
@@ -17,6 +18,9 @@ const ENRICH_SYSTEM: &str =
 const ENRICH_MAX_TOKENS: u32 = 200;
 /// Synthese (TL;DR: 3 Bullets · Gegenperspektive: 2-3 Sätze) — deckelt den Generierungs-Schwanz.
 const SYNTH_MAX_TOKENS: u32 = 400;
+/// Harte Obergrenze je Enrich-Item — ein einzelnes hängendes Item blockiert die Charge nicht
+/// (zusätzlich zum client-weiten Request-Timeout in ibrief_llm, aber enger).
+const ENRICH_ITEM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 const COUNTERPOINT_SYSTEM: &str =
     "Du bist ein fairer, intellektuell ehrlicher Sparringspartner — kein Provokateur.";
@@ -34,7 +38,8 @@ struct EnrichOut {
 }
 
 /// ENRICH: für die ersten `max` Items eine Ein-Satz-Zusammenfassung + Tags erzeugen.
-/// Läuft parallel in Batches à 4, um Ollama nicht zu überlasten.
+/// Bis zu `CONCURRENCY` Items gleichzeitig via `buffer_unordered` (kein Chunk-Barriere-/
+/// Head-of-Line-Blocking) und je Item hart timeboxed — ein hängendes Item stoppt die Charge nicht.
 pub async fn enrich(
     mut items: Vec<ContentItem>,
     model: &dyn LanguageModel,
@@ -43,24 +48,39 @@ pub async fn enrich(
     let n = max.min(items.len());
     let started = std::time::Instant::now();
     const CONCURRENCY: usize = 4;
-    for chunk_start in (0..n).step_by(CONCURRENCY) {
-        let chunk_end = (chunk_start + CONCURRENCY).min(n);
-        let futs: Vec<_> = (chunk_start..chunk_end)
-            .map(|i| enrich_one(&items[i], model))
-            .collect();
-        let results = futures::future::join_all(futs).await;
-        for (i, result) in (chunk_start..).zip(results) {
-            match result {
-                Ok(out) => {
-                    items[i].summary = Some(out.summary);
-                    items[i].topics = out.topics;
-                }
-                Err(e) => {
-                    tracing::warn!(title = %items[i].title, error = %e, "enrich fehlgeschlagen")
+
+    let outcomes: Vec<(usize, Option<EnrichOut>)> = futures::stream::iter(0..n)
+        .map(|i| {
+            let item = &items[i];
+            async move {
+                match tokio::time::timeout(ENRICH_ITEM_TIMEOUT, enrich_one(item, model)).await {
+                    Ok(Ok(out)) => (i, Some(out)),
+                    Ok(Err(e)) => {
+                        tracing::warn!(title = %item.title, error = %e, "enrich fehlgeschlagen");
+                        (i, None)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            title = %item.title,
+                            timeout_s = ENRICH_ITEM_TIMEOUT.as_secs(),
+                            "enrich-Timeout — Item übersprungen"
+                        );
+                        (i, None)
+                    }
                 }
             }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+
+    for (i, out) in outcomes {
+        if let Some(out) = out {
+            items[i].summary = Some(out.summary);
+            items[i].topics = out.topics;
         }
     }
+
     let ok = items
         .iter()
         .take(n)
