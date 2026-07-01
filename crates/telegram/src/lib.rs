@@ -11,6 +11,15 @@ use anyhow::Result;
 use ibrief_core::{Briefing, FeedbackKind};
 use ibrief_store::Store;
 use serde::Deserialize;
+use std::time::Duration;
+
+/// Long-Poll-Dauer von getUpdates (Sekunden) — die Bot-API hält die Verbindung so lange offen.
+const POLL_TIMEOUT_S: u64 = 30;
+/// Client-Timeout für normale Aufrufe (sendMessage etc.) — ein hängender Push darf den
+/// nächtlichen Lauf nicht blockieren.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout für getUpdates: Long-Poll-Dauer + Puffer, sonst bricht der Client den Poll ab.
+const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(POLL_TIMEOUT_S + 15);
 
 pub struct Telegram {
     token: String,
@@ -20,10 +29,15 @@ pub struct Telegram {
 
 impl Telegram {
     pub fn new(token: String, chat_id: String) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("reqwest-Client bauen (nur TLS-Init kann scheitern)");
         Self {
             token,
             chat_id,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -84,7 +98,9 @@ impl Telegram {
             let updates = match self.get_updates(offset).await {
                 Ok(u) => u,
                 Err(e) => {
-                    tracing::warn!(error = %e, "getUpdates fehlgeschlagen, neuer Versuch");
+                    // Kurze Pause statt Hot-Loop, wenn das Netz/Telegram gerade weg ist.
+                    tracing::warn!(error = %e, "getUpdates fehlgeschlagen, neuer Versuch in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             };
@@ -116,12 +132,13 @@ impl Telegram {
     async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
         let body = serde_json::json!({
             "offset": offset,
-            "timeout": 30,
+            "timeout": POLL_TIMEOUT_S,
             "allowed_updates": ["callback_query"],
         });
         let resp: TgResponse<Vec<Update>> = self
             .http
             .post(self.url("getUpdates"))
+            .timeout(POLL_REQUEST_TIMEOUT)
             .json(&body)
             .send()
             .await?

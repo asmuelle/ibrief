@@ -97,6 +97,27 @@ pub async fn enrich(
     items
 }
 
+/// Pause vor dem einmaligen Retry nach einem Infrastruktur-Fehler (Backend kurz weg/5xx).
+const ENRICH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ein Completion-Aufruf mit genau EINEM Retry bei Infrastruktur-Fehlern (§T2.8):
+/// transiente Ausfälle (Backend down, Timeout, 5xx) kosten sonst das Item — inhaltliche
+/// Fehler (Decode/4xx) werden nicht wiederholt, die würde ein zweiter Versuch nicht heilen.
+async fn complete_with_retry(
+    model: &dyn LanguageModel,
+    req: &Completion,
+    what: &str,
+) -> Result<String, ibrief_llm::ModelError> {
+    match model.complete(req).await {
+        Err(e) if e.is_infrastructure() => {
+            tracing::warn!(what, error = %e, "Infrastruktur-Fehler — einmaliger Retry");
+            tokio::time::sleep(ENRICH_RETRY_DELAY).await;
+            model.complete(req).await
+        }
+        other => other,
+    }
+}
+
 async fn enrich_one(item: &ContentItem, model: &dyn LanguageModel) -> Result<EnrichOut> {
     let context = item.raw_summary.clone().unwrap_or_default();
     let prompt = format!(
@@ -110,7 +131,7 @@ async fn enrich_one(item: &ContentItem, model: &dyn LanguageModel) -> Result<Enr
         .max_tokens(ENRICH_MAX_TOKENS)
         .json();
     let t0 = std::time::Instant::now();
-    let raw = model.complete(&req).await?;
+    let raw = complete_with_retry(model, &req, "enrich").await?;
     tracing::debug!(
         title = %item.title,
         elapsed_ms = t0.elapsed().as_millis() as u64,

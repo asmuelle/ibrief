@@ -6,6 +6,13 @@
 use anyhow::Result;
 use ibrief_core::ContentItem;
 use serde::Deserialize;
+use std::time::Duration;
+
+/// Timeout für den reinen Verbindungsaufbau (tote Feeds → schnell scheitern).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Gesamt-Timeout je Feed-Abruf. Ein hängender Feed darf den nächtlichen,
+/// unbeaufsichtigten Lauf nicht blockieren (gleiche Fehlerklasse wie §T0.3 bei Ollama).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Eine Quelle aus `sources.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -16,7 +23,11 @@ pub struct Source {
 
 /// Alle Quellen abrufen; fehlerhafte Quellen werden übersprungen.
 pub async fn fetch_all(sources: &[Source]) -> Vec<ContentItem> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest-Client bauen (nur TLS-Init kann scheitern)");
     let mut items = Vec::new();
     for src in sources {
         match fetch_one(&client, src).await {
