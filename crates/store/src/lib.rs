@@ -37,6 +37,8 @@ pub struct FeedbackMeta {
     pub source_id: String,
     pub topics: Vec<String>,
     pub kind: String,
+    /// Zeitstempel (RFC3339) des Ereignisses — Grundlage für den Zeitverfall (§T2.5).
+    pub created_at: String,
 }
 
 /// Metadaten einer Config-Version (für `config list` / Rollback).
@@ -541,7 +543,7 @@ impl Store {
     /// Alle Feedback-Ereignisse mit Quelle/Themen des betroffenen Items.
     pub async fn feedback_join_meta(&self) -> Result<Vec<FeedbackMeta>> {
         let rows = sqlx::query(
-            "SELECT ci.source_id, ci.topics, f.kind
+            "SELECT ci.source_id, ci.topics, f.kind, f.created_at
              FROM feedback f
              JOIN content_items ci ON ci.id = f.item_id",
         )
@@ -556,6 +558,7 @@ impl Store {
                 source_id: r.get("source_id"),
                 topics,
                 kind: r.get("kind"),
+                created_at: r.get("created_at"),
             });
         }
         Ok(out)

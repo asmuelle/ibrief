@@ -690,6 +690,7 @@ name = "ibrief-learn"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "ibrief-core",
  "ibrief-store",
  "rand 0.8.6",

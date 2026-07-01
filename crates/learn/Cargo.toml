@@ -8,6 +8,7 @@ license.workspace = true
 ibrief-core.workspace = true
 ibrief-store.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 rand.workspace = true

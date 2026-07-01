@@ -9,6 +9,7 @@
 //! dass Arme aussterben — das ist Anti-Blase auf Mechanismus-Ebene.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use ibrief_core::Config;
 use ibrief_store::{FeedbackMeta, Store};
 use rand::SeedableRng;
@@ -23,6 +24,21 @@ pub const MIN_WEIGHT: f64 = 0.2;
 pub const MAX_WEIGHT: f64 = 2.0;
 /// Maximaler Anteil einer einzelnen Quelle am Gewichtsbudget (Diversitäts-Gate).
 const MAX_SOURCE_SHARE: f64 = 0.5;
+/// Halbwertszeit des Feedback-Zeitverfalls (§T2.5): ein 👍 von vor einem Monat zählt halb,
+/// von vor zwei Monaten ein Viertel. Präferenzen dürfen sich ändern — alte Evidenz soll
+/// neue nicht dauerhaft überstimmen.
+pub const FEEDBACK_HALF_LIFE_DAYS: f64 = 30.0;
+
+/// Zeitverfall eines Feedback-Ereignisses relativ zu `now`: 0.5^(Alter/Halbwertszeit).
+/// Unparsebarer/fehlender Zeitstempel zählt voll (fail-open — Alt-Zeilen ohne saubere
+/// Timestamps verlieren keine Stimme).
+fn decay(created_at: &str, now: DateTime<Utc>) -> f64 {
+    let Ok(t) = DateTime::parse_from_rfc3339(created_at) else {
+        return 1.0;
+    };
+    let age_days = (now - t.with_timezone(&Utc)).num_seconds().max(0) as f64 / 86_400.0;
+    0.5_f64.powf(age_days / FEEDBACK_HALF_LIFE_DAYS)
+}
 
 /// Positive/negative Evidenz eines Bandit-Arms (Quelle oder Thema).
 #[derive(Debug, Default, Clone, Copy)]
@@ -75,9 +91,10 @@ pub async fn load_active(store: &Store) -> Result<Config> {
 /// (2) Eval-Gate: der Kandidat darf die aus REALEM Feedback abgeleitete Präferenz-AUC
 /// nicht verschlechtern (§6.4.1/§T1.1). Erst wenn beide Gates passen, wird übernommen.
 pub async fn learn_once(store: &Store, seed: u64) -> Result<LearnOutcome> {
+    let now = Utc::now();
     let active = load_active(store).await?;
     let rows = store.feedback_join_meta().await?;
-    let (sources, topics) = aggregate(&rows);
+    let (sources, topics) = aggregate(&rows, now);
 
     let mut rng = StdRng::seed_from_u64(seed);
     let candidate = propose(&active, &sources, &topics, &mut rng);
@@ -88,8 +105,8 @@ pub async fn learn_once(store: &Store, seed: u64) -> Result<LearnOutcome> {
     // Präferenz-Übereinstimmung beider Configs gegen dasselbe Feedback (in-sample; bei
     // Single-User gibt es keinen Holdout — fängt aber Explorationsproben, die der
     // gezeigten Präferenz widersprechen, statt sie blind zu übernehmen).
-    let eval_active = preference_auc(&active, &rows);
-    let eval_candidate = preference_auc(&candidate, &rows);
+    let eval_active = preference_auc(&active, &rows, now);
+    let eval_candidate = preference_auc(&candidate, &rows, now);
 
     let outcome = |adopted: bool, reason: String, gate_reasons: Vec<String>| LearnOutcome {
         adopted,
@@ -122,7 +139,12 @@ pub async fn learn_once(store: &Store, seed: u64) -> Result<LearnOutcome> {
         ));
     }
 
+    // Gleichstand explizit als Explorations-Schritt ausweisen (§T2.5): die Übernahme
+    // stützt sich dann NICHT auf Evidenz — das soll in `config list` sichtbar sein.
     let eval_note = match (eval_active, eval_candidate) {
+        (Some(b), Some(c)) if (c - b).abs() <= EVAL_TOLERANCE => {
+            format!("Präferenz-AUC unverändert ({b:.3}) — Übernahme ist Explorations-Schritt")
+        }
         (Some(b), Some(c)) => format!("Präferenz-AUC {b:.3} → {c:.3}"),
         _ => "Eval inconclusive (einseitiges/dünnes Feedback) — nur Invarianten".into(),
     };
@@ -162,35 +184,48 @@ fn config_score(cfg: &Config, source_id: &str, topics: &[String]) -> f64 {
     source_w * topic_w
 }
 
-/// Präferenz-AUC (§T1.1): Wahrscheinlichkeit, dass die Config ein positiv bewertetes
-/// Ereignis höher rankt als ein negativ bewertetes — die Ground-Truth-Metrik für den
-/// Eval-Gate. `None`, wenn Positiva ODER Negativa fehlen (kein diskriminierendes Signal).
-pub fn preference_auc(cfg: &Config, rows: &[FeedbackMeta]) -> Option<f64> {
-    let mut pos = Vec::new();
-    let mut neg = Vec::new();
+/// Präferenz-AUC (§T1.1, gewichtet §T2.5): Wahrscheinlichkeit, dass die Config ein positiv
+/// bewertetes Ereignis höher rankt als ein negativ bewertetes — die Ground-Truth-Metrik für
+/// den Eval-Gate. Jedes Paar zählt mit `|reward| × Zeitverfall` beider Ereignisse: ein
+/// frisches 👎 wiegt schwerer als ein altes „geöffnet". `None`, wenn Positiva ODER Negativa
+/// fehlen (kein diskriminierendes Signal).
+pub fn preference_auc(cfg: &Config, rows: &[FeedbackMeta], now: DateTime<Utc>) -> Option<f64> {
+    // (Score der Config, Gewicht des Ereignisses)
+    let mut pos: Vec<(f64, f64)> = Vec::new();
+    let mut neg: Vec<(f64, f64)> = Vec::new();
     for r in rows {
         let reward = event_reward(&r.kind);
+        if reward == 0.0 {
+            continue;
+        }
+        let weight = reward.abs() * decay(&r.created_at, now);
         let score = config_score(cfg, &r.source_id, &r.topics);
         if reward > 0.0 {
-            pos.push(score);
-        } else if reward < 0.0 {
-            neg.push(score);
+            pos.push((score, weight));
+        } else {
+            neg.push((score, weight));
         }
     }
     if pos.is_empty() || neg.is_empty() {
         return None;
     }
     let mut agree = 0.0;
-    for &p in &pos {
-        for &n in &neg {
+    let mut total = 0.0;
+    for &(p, wp) in &pos {
+        for &(n, wn) in &neg {
+            let w = wp * wn;
+            total += w;
             if p > n + EVAL_TOLERANCE {
-                agree += 1.0;
+                agree += w;
             } else if (p - n).abs() <= EVAL_TOLERANCE {
-                agree += 0.5;
+                agree += 0.5 * w;
             }
         }
     }
-    Some(agree / (pos.len() * neg.len()) as f64)
+    if total <= 0.0 {
+        return None;
+    }
+    Some(agree / total)
 }
 
 /// Setzt die aktive Config auf eine frühere Version zurück (§6.4 Rollback).
@@ -202,8 +237,12 @@ pub async fn rollback(store: &Store, version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Aggregiert Feedback je Quelle und je Thema zu Beta-Evidenz.
-pub fn aggregate(rows: &[FeedbackMeta]) -> (HashMap<String, ArmStats>, HashMap<String, ArmStats>) {
+/// Aggregiert Feedback je Quelle und je Thema zu Beta-Evidenz — zeitverfallen (§T2.5):
+/// die Evidenz eines Ereignisses schrumpft mit 0.5^(Alter/[`FEEDBACK_HALF_LIFE_DAYS`]).
+pub fn aggregate(
+    rows: &[FeedbackMeta],
+    now: DateTime<Utc>,
+) -> (HashMap<String, ArmStats>, HashMap<String, ArmStats>) {
     let mut sources: HashMap<String, ArmStats> = HashMap::new();
     let mut topics: HashMap<String, ArmStats> = HashMap::new();
 
@@ -214,6 +253,8 @@ pub fn aggregate(rows: &[FeedbackMeta]) -> (HashMap<String, ArmStats>, HashMap<S
             "down" | "less" => (0.0, 1.0),
             _ => (0.0, 0.0),
         };
+        let d = decay(&r.created_at, now);
+        let (dp, dn) = (dp * d, dn * d);
         let s = sources.entry(r.source_id.clone()).or_default();
         s.pos += dp;
         s.neg += dn;
@@ -353,11 +394,23 @@ mod tests {
     use ibrief_core::Config;
     use std::collections::BTreeMap;
 
+    /// Fixe „Jetzt"-Zeit für deterministische Decay-Tests.
+    fn test_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     fn fb(source: &str, topic: &str, kind: &str) -> FeedbackMeta {
+        fb_at(source, topic, kind, "2026-07-01T12:00:00Z")
+    }
+
+    fn fb_at(source: &str, topic: &str, kind: &str, created_at: &str) -> FeedbackMeta {
         FeedbackMeta {
             source_id: source.into(),
             topics: vec![topic.into()],
             kind: kind.into(),
+            created_at: created_at.into(),
         }
     }
 
@@ -375,21 +428,24 @@ mod tests {
 
         // Config, die verge hoch und hn niedrig gewichtet → perfekte Übereinstimmung.
         let aligned = cfg_sources(&[("verge", 2.0), ("hn", 0.2)]);
-        assert_eq!(preference_auc(&aligned, &rows), Some(1.0));
+        assert_eq!(preference_auc(&aligned, &rows, test_now()), Some(1.0));
 
         // Neutral → alle Scores gleich → unentschieden.
-        assert_eq!(preference_auc(&Config::default(), &rows), Some(0.5));
+        assert_eq!(
+            preference_auc(&Config::default(), &rows, test_now()),
+            Some(0.5)
+        );
 
         // Invertiert → widerspricht der Präferenz → 0.0 (das Eval-Gate würde verwerfen).
         let inverted = cfg_sources(&[("verge", 0.2), ("hn", 2.0)]);
-        assert_eq!(preference_auc(&inverted, &rows), Some(0.0));
+        assert_eq!(preference_auc(&inverted, &rows, test_now()), Some(0.0));
     }
 
     #[test]
     fn preference_auc_none_without_both_signs() {
         // Nur positives Feedback → kein diskriminierendes Paar → nicht beurteilbar.
         let rows = vec![fb("verge", "ai", "up"), fb("hn", "rust", "up")];
-        assert_eq!(preference_auc(&Config::default(), &rows), None);
+        assert_eq!(preference_auc(&Config::default(), &rows, test_now()), None);
     }
 
     #[test]
@@ -399,10 +455,68 @@ mod tests {
             fb("verge", "ai", "up"),
             fb("hn", "rust", "down"),
         ];
-        let (sources, topics) = aggregate(&rows);
+        let (sources, topics) = aggregate(&rows, test_now());
         assert_eq!(sources["verge"].pos, 2.0);
         assert_eq!(sources["hn"].neg, 1.0);
         assert_eq!(topics["ai"].pos, 2.0);
+    }
+
+    #[test]
+    fn aggregate_decays_old_evidence() {
+        // Ein 👍 von vor 30 Tagen (= Halbwertszeit) zählt halb, eines von vor 60 Tagen viertel.
+        let rows = vec![
+            fb_at("verge", "ai", "up", "2026-07-01T12:00:00Z"), // frisch → 1.0
+            fb_at("verge", "ai", "up", "2026-06-01T12:00:00Z"), // 30 Tage → 0.5
+            fb_at("verge", "ai", "up", "2026-05-02T12:00:00Z"), // 60 Tage → 0.25
+        ];
+        let (sources, _) = aggregate(&rows, test_now());
+        assert!((sources["verge"].pos - 1.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn aggregate_counts_unparseable_timestamp_fully() {
+        // Fail-open: kaputter Zeitstempel ⇒ volles Gewicht statt stiller Entwertung.
+        let rows = vec![fb_at("verge", "ai", "up", "kein-datum")];
+        let (sources, _) = aggregate(&rows, test_now());
+        assert_eq!(sources["verge"].pos, 1.0);
+    }
+
+    #[test]
+    fn preference_auc_weights_recent_over_stale() {
+        // Konflikt auf derselben Quelle: altes 👍 (60 Tage) vs. frisches 👎 auf "hn",
+        // dazu ein frisches 👍 auf "verge". Eine Config, die hn HOCH gewichtet, gewinnt
+        // nur das alte (leichte) Paar und verliert das frische (schwere) → AUC < 0.5.
+        let rows = vec![
+            fb_at("verge", "ai", "up", "2026-07-01T12:00:00Z"),
+            fb_at("hn", "rust", "up", "2026-05-02T12:00:00Z"),
+            fb_at("hn", "rust", "down", "2026-07-01T12:00:00Z"),
+        ];
+        let hn_heavy = cfg_sources(&[("verge", 0.2), ("hn", 2.0)]);
+        let auc = preference_auc(&hn_heavy, &rows, test_now()).unwrap();
+        assert!(auc < 0.5, "frisches Negativ muss dominieren, AUC war {auc}");
+
+        // Die zur gezeigten (frischen) Präferenz passende Config schlägt sie klar.
+        let aligned = cfg_sources(&[("verge", 2.0), ("hn", 0.2)]);
+        let auc_aligned = preference_auc(&aligned, &rows, test_now()).unwrap();
+        assert!(auc_aligned > 0.5);
+    }
+
+    #[test]
+    fn preference_auc_weights_explicit_over_open() {
+        // "open" (0.3) darf ein explizites 👍/👎-Paar nicht überstimmen: verge bekommt
+        // ein schwaches open-Positiv UND ein volles Down; hn ein volles Up.
+        let rows = vec![
+            fb("verge", "ai", "open"),
+            fb("verge", "ai", "down"),
+            fb("hn", "rust", "up"),
+        ];
+        // Config bevorzugt verge → stimmt nur mit dem schwachen open-Paar überein.
+        let verge_heavy = cfg_sources(&[("verge", 2.0), ("hn", 0.2)]);
+        let auc = preference_auc(&verge_heavy, &rows, test_now()).unwrap();
+        assert!(
+            auc < 0.5,
+            "explizites Feedback muss dominieren, AUC war {auc}"
+        );
     }
 
     #[test]

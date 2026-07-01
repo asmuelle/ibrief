@@ -162,6 +162,7 @@ mod tests {
             source_id: source.into(),
             topics: vec![],
             kind: kind.into(),
+            created_at: "2026-07-01T12:00:00Z".into(),
         }
     }
 
