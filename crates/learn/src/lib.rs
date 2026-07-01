@@ -47,7 +47,16 @@ pub struct LearnOutcome {
     pub reason: String,
     pub gate_reasons: Vec<String>,
     pub n_feedback: usize,
+    /// Präferenz-AUC der AKTIVEN Config gegen reales Feedback (§T1.1). `None` = zu
+    /// dünnes/einseitiges Feedback für ein Urteil (dann nur Invarianten geprüft).
+    pub eval_active: Option<f64>,
+    /// Präferenz-AUC der KANDIDATEN-Config gegen dasselbe Feedback.
+    pub eval_candidate: Option<f64>,
 }
+
+/// Toleranz des Eval-Gates: der Kandidat wird nur verworfen, wenn er die Präferenz-AUC
+/// echt (jenseits FP-Rauschen) verschlechtert. Gleichstand/Verbesserung → erlaubt.
+const EVAL_TOLERANCE: f64 = 1e-9;
 
 /// Lädt die aktive Config (neutraler Default, falls noch nie gelernt).
 pub async fn load_active(store: &Store) -> Result<Config> {
@@ -61,6 +70,10 @@ pub async fn load_active(store: &Store) -> Result<Config> {
 }
 
 /// Ein kompletter Lern-Schritt. `seed` macht das Sampling reproduzierbar.
+///
+/// Ablauf: Kandidat samplen → (1) strukturelle Invarianten (Safety Gate) →
+/// (2) Eval-Gate: der Kandidat darf die aus REALEM Feedback abgeleitete Präferenz-AUC
+/// nicht verschlechtern (§6.4.1/§T1.1). Erst wenn beide Gates passen, wird übernommen.
 pub async fn learn_once(store: &Store, seed: u64) -> Result<LearnOutcome> {
     let active = load_active(store).await?;
     let rows = store.feedback_join_meta().await?;
@@ -72,32 +85,112 @@ pub async fn learn_once(store: &Store, seed: u64) -> Result<LearnOutcome> {
     let version = config_version(&candidate);
     let parent = store.active_config_version().await?;
 
+    // Präferenz-Übereinstimmung beider Configs gegen dasselbe Feedback (in-sample; bei
+    // Single-User gibt es keinen Holdout — fängt aber Explorationsproben, die der
+    // gezeigten Präferenz widersprechen, statt sie blind zu übernehmen).
+    let eval_active = preference_auc(&active, &rows);
+    let eval_candidate = preference_auc(&candidate, &rows);
+
+    let outcome = |adopted: bool, reason: String, gate_reasons: Vec<String>| LearnOutcome {
+        adopted,
+        version: version.clone(),
+        parent: parent.clone(),
+        reason,
+        gate_reasons,
+        n_feedback: rows.len(),
+        eval_active,
+        eval_candidate,
+    };
+
+    // (1) Strukturelle Invarianten.
     if !gate.passed {
-        return Ok(LearnOutcome {
-            adopted: false,
-            version,
-            parent,
-            reason: "Safety Gate fehlgeschlagen — Kandidat verworfen".into(),
-            gate_reasons: gate.reasons,
-            n_feedback: rows.len(),
-        });
+        return Ok(outcome(
+            false,
+            "Safety Gate fehlgeschlagen — Kandidat verworfen".into(),
+            gate.reasons,
+        ));
     }
 
+    // (2) Eval-Gate: keine Verschlechterung der Präferenz-AUC (falls beurteilbar).
+    if let (Some(base), Some(cand)) = (eval_active, eval_candidate)
+        && cand + EVAL_TOLERANCE < base
+    {
+        return Ok(outcome(
+            false,
+            format!("Eval-Gate: Präferenz-AUC verschlechtert ({base:.3} → {cand:.3}) — verworfen"),
+            gate.reasons,
+        ));
+    }
+
+    let eval_note = match (eval_active, eval_candidate) {
+        (Some(b), Some(c)) => format!("Präferenz-AUC {b:.3} → {c:.3}"),
+        _ => "Eval inconclusive (einseitiges/dünnes Feedback) — nur Invarianten".into(),
+    };
+    let reason = format!(
+        "Thompson-Update aus {} Feedback-Ereignissen · {eval_note}",
+        rows.len()
+    );
     let payload = serde_json::to_string(&candidate)?;
-    let reason = format!("Thompson-Update aus {} Feedback-Ereignissen", rows.len());
     store
         .save_config(&version, parent.as_deref(), &reason, &payload)
         .await?;
     store.set_active_config(&version).await?;
 
-    Ok(LearnOutcome {
-        adopted: true,
-        version,
-        parent,
-        reason,
-        gate_reasons: gate.reasons,
-        n_feedback: rows.len(),
-    })
+    Ok(outcome(true, reason, gate.reasons))
+}
+
+/// Reward eines Feedback-Ereignisses (konsistent mit [`aggregate`]): explizit positiv/negativ
+/// dominiert, Öffnen zählt schwach positiv.
+fn event_reward(kind: &str) -> f64 {
+    match kind {
+        "up" | "more" => 1.0,
+        "open" => 0.3,
+        "down" | "less" => -1.0,
+        _ => 0.0,
+    }
+}
+
+/// Ranking-Score, den eine Config einem Item (Quelle + Themen) gibt — der lernbare Teil von
+/// `pipeline::rank` (ohne die config-unabhängige Aktualität).
+fn config_score(cfg: &Config, source_id: &str, topics: &[String]) -> f64 {
+    let source_w = cfg.source_weight(source_id);
+    let topic_w = if topics.is_empty() {
+        1.0
+    } else {
+        topics.iter().map(|t| cfg.topic_weight(t)).sum::<f64>() / topics.len() as f64
+    };
+    source_w * topic_w
+}
+
+/// Präferenz-AUC (§T1.1): Wahrscheinlichkeit, dass die Config ein positiv bewertetes
+/// Ereignis höher rankt als ein negativ bewertetes — die Ground-Truth-Metrik für den
+/// Eval-Gate. `None`, wenn Positiva ODER Negativa fehlen (kein diskriminierendes Signal).
+pub fn preference_auc(cfg: &Config, rows: &[FeedbackMeta]) -> Option<f64> {
+    let mut pos = Vec::new();
+    let mut neg = Vec::new();
+    for r in rows {
+        let reward = event_reward(&r.kind);
+        let score = config_score(cfg, &r.source_id, &r.topics);
+        if reward > 0.0 {
+            pos.push(score);
+        } else if reward < 0.0 {
+            neg.push(score);
+        }
+    }
+    if pos.is_empty() || neg.is_empty() {
+        return None;
+    }
+    let mut agree = 0.0;
+    for &p in &pos {
+        for &n in &neg {
+            if p > n + EVAL_TOLERANCE {
+                agree += 1.0;
+            } else if (p - n).abs() <= EVAL_TOLERANCE {
+                agree += 0.5;
+            }
+        }
+    }
+    Some(agree / (pos.len() * neg.len()) as f64)
 }
 
 /// Setzt die aktive Config auf eine frühere Version zurück (§6.4 Rollback).
@@ -266,6 +359,37 @@ mod tests {
             topics: vec![topic.into()],
             kind: kind.into(),
         }
+    }
+
+    fn cfg_sources(pairs: &[(&str, f64)]) -> Config {
+        Config {
+            source_weights: pairs.iter().map(|(s, w)| (s.to_string(), *w)).collect(),
+            topic_weights: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn preference_auc_rewards_alignment() {
+        // Owner mag verge (👍), nicht hn (👎).
+        let rows = vec![fb("verge", "ai", "up"), fb("hn", "rust", "down")];
+
+        // Config, die verge hoch und hn niedrig gewichtet → perfekte Übereinstimmung.
+        let aligned = cfg_sources(&[("verge", 2.0), ("hn", 0.2)]);
+        assert_eq!(preference_auc(&aligned, &rows), Some(1.0));
+
+        // Neutral → alle Scores gleich → unentschieden.
+        assert_eq!(preference_auc(&Config::default(), &rows), Some(0.5));
+
+        // Invertiert → widerspricht der Präferenz → 0.0 (das Eval-Gate würde verwerfen).
+        let inverted = cfg_sources(&[("verge", 0.2), ("hn", 2.0)]);
+        assert_eq!(preference_auc(&inverted, &rows), Some(0.0));
+    }
+
+    #[test]
+    fn preference_auc_none_without_both_signs() {
+        // Nur positives Feedback → kein diskriminierendes Paar → nicht beurteilbar.
+        let rows = vec![fb("verge", "ai", "up"), fb("hn", "rust", "up")];
+        assert_eq!(preference_auc(&Config::default(), &rows), None);
     }
 
     #[test]

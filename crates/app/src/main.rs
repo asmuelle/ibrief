@@ -701,6 +701,12 @@ async fn run_learn(profile: &ProfileFile) -> Result<()> {
         println!("  {}", outcome.reason);
     }
     println!("  Feedback-Ereignisse: {}", outcome.n_feedback);
+    match (outcome.eval_active, outcome.eval_candidate) {
+        (Some(a), Some(c)) => {
+            println!("  Präferenz-AUC (reales Feedback): aktiv {a:.3} → Kandidat {c:.3}")
+        }
+        _ => println!("  Präferenz-AUC: nicht beurteilbar (einseitiges/dünnes Feedback)"),
+    }
     for r in &outcome.gate_reasons {
         println!("  · Gate: {r}");
     }
