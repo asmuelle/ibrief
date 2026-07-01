@@ -518,6 +518,16 @@ impl Store {
         }))
     }
 
+    /// Jüngste Briefing-Tage (neueste zuerst) — Schatten-Inputs für den Prompt-Optimizer
+    /// (§T2.4: Urteil über mehrere Tage statt n=1).
+    pub async fn recent_briefing_dates(&self, limit: i64) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT date FROM briefings ORDER BY date DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("date")).collect())
+    }
+
     /// Speichert eine Eval-Note (idempotent pro date × config_version).
     pub async fn save_eval(&self, e: &EvalRow) -> Result<()> {
         let notes = serde_json::to_string(&e.notes)?;

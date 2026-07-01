@@ -13,6 +13,9 @@ synth_model = "gemma4:31b"
 # Embedding-Tier: semantische Cross-Source-Dedup + Diversitäts-Kappe in der Kuration.
 # Leer lassen = Feature aus (Pipeline degradiert auf URL-Dedup/Quellen-Diversität).
 embed_model = "nomic-embed-text:latest"
+# Judge für Schatten-Tests (optimize/eval lokal). Leer = synth_model. Gegen Selbst-Präferenz
+# idealerweise eine ANDERE Modellfamilie wählen (z.B. qwen3:30b-a3b nach `ollama pull`).
+judge_model = ""
 max_items_enrich = 15
 top_n = 8
 # Quellen mit quality < diesem Wert werden nicht kuratiert (0.0 = aus). Seed-Qualität ist 0.5;

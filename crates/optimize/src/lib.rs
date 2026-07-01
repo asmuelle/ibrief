@@ -1,6 +1,13 @@
 //! Prompt-Optimierung (§6.3 B / §6.5): ein Optimizer-LLM erzeugt eine Prompt-Variante,
-//! die im **Schatten-Test** gegen den aktiven Prompt antritt (beide rendern, der Judge
-//! bewertet) — und nur bei klarem Vorsprung Default wird. Kein Risiko fürs Live-Briefing.
+//! die im **Schatten-Test** gegen den aktiven Prompt antritt — und nur bei klarem
+//! Vorsprung Default wird. Kein Risiko fürs Live-Briefing.
+//!
+//! Urteils-Design (§T2.4): Der Judge vergleicht beide Ausgaben **paarweise in einem
+//! Prompt** statt sie einzeln absolut zu benoten — absolute 0-1-Scores kleiner lokaler
+//! Modelle sind deutlich verrauschter als Vergleiche. Jedes Paar wird **zweimal mit
+//! getauschten Positionen** bewertet (Positions-Bias kürzt sich raus: nur wer beide
+//! Reihenfolgen gewinnt, gewinnt das Paar) und über **mehrere jüngste Briefing-Tage**
+//! wiederholt. Übernommen wird nur, wer mindestens einen Tag gewinnt und keinen verliert.
 //!
 //! Aktuell für den `tldr`-Slot. Weitere Slots (Sektions-Kuratierung) folgen demselben Muster.
 
@@ -12,8 +19,8 @@ use serde::Deserialize;
 /// Slot-Bezeichner für den TL;DR-Prompt.
 pub const SLOT_TLDR: &str = "tldr";
 
-/// Mindest-Vorsprung im Judge-Score, damit ein Kandidat den aktiven Prompt ablöst.
-const SHADOW_MARGIN: f64 = 0.05;
+/// Über wie viele jüngste Briefing-Tage der Schatten-Test läuft (sofern vorhanden).
+const SHADOW_DATES: usize = 3;
 
 /// Standard-Prompt für den TL;DR-Slot (Seed). `{items}` wird durch die Meldungen ersetzt.
 pub const TLDR_DEFAULT: &str = "Hier sind die heutigen Meldungen:\n{items}\n\n\
@@ -32,11 +39,35 @@ pub struct ActivePrompt {
     pub template: String,
 }
 
-/// Ergebnis des Schatten-Vergleichs.
-#[derive(Debug, Clone)]
-pub struct Shadow {
-    pub active_score: f64,
-    pub candidate_score: f64,
+/// Urteil über EIN Paar (aktiv vs. Kandidat) nach beiden Positions-Reihenfolgen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairVerdict {
+    /// Kandidat gewinnt BEIDE Reihenfolgen.
+    Candidate,
+    /// Aktiver Prompt gewinnt BEIDE Reihenfolgen.
+    Active,
+    /// Widersprüchlich oder unentschieden (z.B. reiner Positions-Bias des Judges).
+    Tie,
+}
+
+/// Bilanz des Schatten-Tests über alle bewerteten Tage.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShadowTally {
+    pub wins: usize,
+    pub losses: usize,
+    pub ties: usize,
+}
+
+impl ShadowTally {
+    fn dates(&self) -> usize {
+        self.wins + self.losses + self.ties
+    }
+}
+
+/// Übernahme-Regel (§T2.4): mindestens ein Tages-Sieg, keine Niederlage. Konservativ —
+/// bei widersprüchlichem Judge bleibt der aktive Prompt.
+pub fn should_adopt(tally: &ShadowTally) -> bool {
+    tally.wins > 0 && tally.losses == 0
 }
 
 /// Ergebnis eines Optimierungslaufs.
@@ -45,7 +76,7 @@ pub struct OptimizeOutcome {
     pub adopted: bool,
     pub active_version: String,
     pub candidate_version: String,
-    pub shadow: Option<Shadow>,
+    pub tally: Option<ShadowTally>,
     pub reason: String,
 }
 
@@ -63,20 +94,34 @@ pub async fn active_tldr(store: &Store) -> Result<ActivePrompt> {
     Ok(ActivePrompt { version, template })
 }
 
-/// Ein Optimierungs-Schritt für den TL;DR-Slot anhand eines Beispiel-Briefings (`date`).
+/// Ein Optimierungs-Schritt für den TL;DR-Slot. `date = Some(..)` beschränkt den
+/// Schatten-Test auf diesen Tag; `None` nutzt bis zu [`SHADOW_DATES`] jüngste Briefings.
 pub async fn optimize_tldr(
     store: &Store,
     optimizer: &dyn LanguageModel,
     synth: &dyn LanguageModel,
     judge: &dyn LanguageModel,
-    date: &str,
+    date: Option<&str>,
 ) -> Result<OptimizeOutcome> {
     let active = active_tldr(store).await?;
 
-    let Some(briefing) = store.load_briefing(date).await? else {
-        anyhow::bail!("kein Briefing für {date} (Beispiel-Input für den Schatten-Test fehlt)");
+    let dates: Vec<String> = match date {
+        Some(d) => vec![d.to_string()],
+        None => store.recent_briefing_dates(SHADOW_DATES as i64).await?,
     };
-    let items_text = items_to_text(&briefing);
+    // Beispiel-Inputs je Tag; Tage ohne (auffindbares) Briefing fallen heraus.
+    let mut inputs: Vec<(String, String)> = Vec::new();
+    for d in &dates {
+        if let Some(b) = store.load_briefing(d).await? {
+            let text = items_to_text(&b);
+            if !text.is_empty() {
+                inputs.push((d.clone(), text));
+            }
+        }
+    }
+    if inputs.is_empty() {
+        anyhow::bail!("kein Briefing als Schatten-Input (erst `ibrief brief`)");
+    }
 
     let candidate_template = propose_prompt(&active.template, optimizer).await?;
     let candidate_version = version_of(&candidate_template);
@@ -86,22 +131,37 @@ pub async fn optimize_tldr(
             adopted: false,
             active_version: active.version,
             candidate_version,
-            shadow: None,
+            tally: None,
             reason: "Kandidat identisch zum aktiven Prompt".into(),
         });
     }
 
-    let shadow = shadow_compare(
-        &items_text,
-        &active.template,
-        &candidate_template,
-        synth,
-        judge,
-    )
-    .await?;
-    let adopted = shadow.candidate_score > shadow.active_score + SHADOW_MARGIN;
+    let mut tally = ShadowTally::default();
+    for (d, items_text) in &inputs {
+        let verdict = shadow_compare(
+            items_text,
+            &active.template,
+            &candidate_template,
+            synth,
+            judge,
+        )
+        .await?;
+        tracing::info!(date = %d, ?verdict, "Schatten-Vergleich (pairwise, beide Reihenfolgen)");
+        match verdict {
+            PairVerdict::Candidate => tally.wins += 1,
+            PairVerdict::Active => tally.losses += 1,
+            PairVerdict::Tie => tally.ties += 1,
+        }
+    }
+    let adopted = should_adopt(&tally);
 
-    let experiment_id = version_of(&format!("{}|{}|{date}", active.version, candidate_version));
+    let date_ids: Vec<&str> = inputs.iter().map(|(d, _)| d.as_str()).collect();
+    let experiment_id = version_of(&format!(
+        "{}|{}|{}",
+        active.version,
+        candidate_version,
+        date_ids.join(",")
+    ));
     store
         .save_experiment(&ExperimentRow {
             id: experiment_id,
@@ -115,8 +175,11 @@ pub async fn optimize_tldr(
         .await?;
 
     let reason = format!(
-        "Schatten-Judge: aktiv={:.2} vs. Kandidat={:.2} (Marge {SHADOW_MARGIN})",
-        shadow.active_score, shadow.candidate_score
+        "Pairwise-Judge über {} Tag(e): Kandidat {} Sieg(e), {} Niederlage(n), {} unentschieden",
+        tally.dates(),
+        tally.wins,
+        tally.losses,
+        tally.ties
     );
 
     if adopted {
@@ -138,7 +201,7 @@ pub async fn optimize_tldr(
         adopted,
         active_version: active.version,
         candidate_version,
-        shadow: Some(shadow),
+        tally: Some(tally),
         reason,
     })
 }
@@ -156,23 +219,86 @@ Gib nur den neuen Prompt zurück."
     Ok(optimizer.complete(&req).await?.trim().to_string())
 }
 
-/// Schatten-Vergleich: beide Prompts rendern lassen, beide Ausgaben vom Judge bewerten.
+/// Schatten-Vergleich für EINEN Input: beide Prompts rendern lassen, dann Pairwise-Urteil
+/// in beiden Positions-Reihenfolgen.
 pub async fn shadow_compare(
     items_text: &str,
     active_template: &str,
     candidate_template: &str,
     synth: &dyn LanguageModel,
     judge: &dyn LanguageModel,
-) -> Result<Shadow> {
+) -> Result<PairVerdict> {
     let active_out = synth
         .complete(&Completion::new(fill(active_template, items_text)))
         .await?;
     let candidate_out = synth
         .complete(&Completion::new(fill(candidate_template, items_text)))
         .await?;
-    Ok(Shadow {
-        active_score: judge_text(&active_out, judge).await?,
-        candidate_score: judge_text(&candidate_out, judge).await?,
+    judge_pair(items_text, &active_out, &candidate_out, judge).await
+}
+
+/// Rohes Einzel-Urteil des Judges: welche der beiden Varianten (A oder B) ist besser?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawWinner {
+    A,
+    B,
+    Tie,
+}
+
+#[derive(Deserialize)]
+struct JudgeOut {
+    winner: String,
+}
+
+async fn judge_once(
+    items_text: &str,
+    a: &str,
+    b: &str,
+    judge: &dyn LanguageModel,
+) -> Result<RawWinner> {
+    let prompt = format!(
+        "Zwei TL;DR-Varianten derselben Meldungen. Welche ist besser nach Prägnanz, \
+Relevanz und Anschlussfähigkeit für Entscheidungen?\n\nMELDUNGEN:\n{items_text}\n\n\
+VARIANTE A:\n{a}\n\nVARIANTE B:\n{b}\n\n\
+Antworte NUR mit JSON {{\"winner\":\"A\"}} oder {{\"winner\":\"B\"}} oder {{\"winner\":\"tie\"}}."
+    );
+    let req = Completion::new(prompt)
+        .with_system(JUDGE_SYSTEM)
+        .temperature(0.1)
+        .json();
+    let raw = judge.complete(&req).await?;
+    let out: JudgeOut = serde_json::from_str(&extract_json(&raw))?;
+    Ok(match out.winner.trim().to_uppercase().as_str() {
+        "A" => RawWinner::A,
+        "B" => RawWinner::B,
+        _ => RawWinner::Tie,
+    })
+}
+
+/// Pairwise-Urteil mit Positions-Swap: Runde 1 (A=aktiv, B=Kandidat), Runde 2 getauscht.
+/// Nur ein Sieg in BEIDEN Reihenfolgen zählt — ein Judge, der stur Position A wählt,
+/// produziert so ein Tie statt eines falschen Signals.
+pub async fn judge_pair(
+    items_text: &str,
+    active_out: &str,
+    candidate_out: &str,
+    judge: &dyn LanguageModel,
+) -> Result<PairVerdict> {
+    let round1 = judge_once(items_text, active_out, candidate_out, judge).await?;
+    let round2 = judge_once(items_text, candidate_out, active_out, judge).await?;
+
+    // In Runde 1 ist der Kandidat B, in Runde 2 ist er A.
+    let candidate_r1 = round1 == RawWinner::B;
+    let candidate_r2 = round2 == RawWinner::A;
+    let active_r1 = round1 == RawWinner::A;
+    let active_r2 = round2 == RawWinner::B;
+
+    Ok(if candidate_r1 && candidate_r2 {
+        PairVerdict::Candidate
+    } else if active_r1 && active_r2 {
+        PairVerdict::Active
+    } else {
+        PairVerdict::Tie
     })
 }
 
@@ -182,24 +308,6 @@ fn fill(template: &str, items_text: &str) -> String {
     } else {
         format!("{template}\n\n{items_text}")
     }
-}
-
-#[derive(Deserialize)]
-struct JudgeOut {
-    overall: f64,
-}
-
-async fn judge_text(text: &str, judge: &dyn LanguageModel) -> Result<f64> {
-    let prompt = format!(
-        "Bewerte dieses TL;DR von 0.0 bis 1.0 nach Prägnanz, Relevanz und Anschlussfähigkeit.\n\
-TL;DR:\n{text}\n\nAntworte nur mit JSON {{\"overall\": 0.0}}."
-    );
-    let req = Completion::new(prompt)
-        .with_system(JUDGE_SYSTEM)
-        .temperature(0.1);
-    let raw = judge.complete(&req).await?;
-    let out: JudgeOut = serde_json::from_str(&extract_json(&raw))?;
-    Ok(out.overall.clamp(0.0, 1.0))
 }
 
 fn items_to_text(b: &ibrief_core::Briefing) -> String {
@@ -251,37 +359,75 @@ mod tests {
         }
     }
 
-    /// Judge: 0.9 wenn der bewertete Text "candidate" enthält, sonst 0.5.
-    struct MarkerJudge;
+    /// Judge: wählt die Variante, deren Text "candidate" enthält — positions-unabhängig.
+    struct ContentJudge;
     #[async_trait]
-    impl LanguageModel for MarkerJudge {
+    impl LanguageModel for ContentJudge {
         async fn complete(&self, req: &Completion) -> Result<String, ibrief_llm::ModelError> {
-            let overall = if req.prompt.contains("candidate") {
-                0.9
-            } else {
-                0.5
-            };
-            Ok(format!("{{\"overall\": {overall}}}"))
+            let a = section(&req.prompt, "VARIANTE A:", "VARIANTE B:");
+            let winner = if a.contains("candidate") { "A" } else { "B" };
+            Ok(format!("{{\"winner\":\"{winner}\"}}"))
         }
         fn label(&self) -> &str {
             "judge"
         }
     }
 
+    /// Judge mit reinem Positions-Bias: wählt IMMER Variante A.
+    struct PositionBiasedJudge;
+    #[async_trait]
+    impl LanguageModel for PositionBiasedJudge {
+        async fn complete(&self, _req: &Completion) -> Result<String, ibrief_llm::ModelError> {
+            Ok(r#"{"winner":"A"}"#.into())
+        }
+        fn label(&self) -> &str {
+            "biased-judge"
+        }
+    }
+
+    fn section<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+        let s = text.find(start).map(|i| i + start.len()).unwrap_or(0);
+        let e = text.find(end).unwrap_or(text.len());
+        &text[s..e.max(s)]
+    }
+
     #[tokio::test]
-    async fn shadow_prefers_better_candidate() {
-        let shadow = shadow_compare(
+    async fn shadow_prefers_better_candidate_in_both_orders() {
+        let verdict = shadow_compare(
             "items",
             "active {items}",
             "BETTER {items}",
             &MarkerSynth,
-            &MarkerJudge,
+            &ContentJudge,
         )
         .await
         .unwrap();
-        assert!(shadow.candidate_score > shadow.active_score);
-        assert!((shadow.candidate_score - 0.9).abs() < 1e-9);
-        assert!((shadow.active_score - 0.5).abs() < 1e-9);
+        assert_eq!(verdict, PairVerdict::Candidate);
+    }
+
+    #[tokio::test]
+    async fn position_bias_cancels_to_tie() {
+        // Der Kern von §T2.4: ein Judge, der stur "A" antwortet, erzeugt KEIN Signal.
+        let verdict = shadow_compare(
+            "items",
+            "active {items}",
+            "BETTER {items}",
+            &MarkerSynth,
+            &PositionBiasedJudge,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verdict, PairVerdict::Tie);
+    }
+
+    #[test]
+    fn adoption_requires_win_and_no_loss() {
+        let t = |wins, losses, ties| ShadowTally { wins, losses, ties };
+        assert!(should_adopt(&t(1, 0, 0)));
+        assert!(should_adopt(&t(2, 0, 1)));
+        assert!(!should_adopt(&t(0, 0, 3))); // nur Ties → kein Beleg
+        assert!(!should_adopt(&t(2, 1, 0))); // eine Niederlage disqualifiziert
+        assert!(!should_adopt(&t(0, 0, 0)));
     }
 
     #[test]

@@ -66,6 +66,10 @@ struct LlmConfig {
     /// Embedding-Modell für semantische Dedup/Diversität (§T2.2). Leer = Feature aus.
     #[serde(default)]
     embed_model: String,
+    /// Lokales Judge-Modell für Schatten-Tests (§T2.4). Leer = synth_model. Idealerweise
+    /// eine ANDERE Modellfamilie als das synth_model, um Selbst-Präferenz zu dämpfen.
+    #[serde(default)]
+    judge_model: String,
     max_items_enrich: usize,
     top_n: usize,
     /// Quellen mit `quality` unter diesem Wert werden nicht kuratiert (0.0 = Filter aus).
@@ -373,10 +377,7 @@ async fn run_eval(profile: &ProfileFile, rest: &[String]) -> Result<()> {
         tracing::info!("Judge via Abo-Kalibrierung (claude -p)");
         Box::new(ClaudeCodeModel::new(Some("opus".to_string())))
     } else {
-        Box::new(OllamaClient::new(
-            profile.llm.ollama_url.clone(),
-            profile.llm.synth_model.clone(),
-        ))
+        Box::new(local_judge(profile))
     };
 
     let weights = EvalWeights::default();
@@ -437,15 +438,13 @@ async fn run_bench(profile: &ProfileFile, rest: &[String]) -> Result<()> {
         anyhow::bail!("kein Briefing für {date} im Store (erst `ibrief brief` für diesen Tag)");
     };
 
-    // Judge: lokal (aktives synth_model) oder Abo-Kalibrierung (claude -p). Für alle Kandidaten gleich.
+    // Judge: lokal (judge_model, Fallback synth_model) oder Abo-Kalibrierung (claude -p).
+    // Für alle Kandidaten gleich.
     let judge: Box<dyn LanguageModel> = if calibrate {
         tracing::info!("Bakeoff-Judge via Abo-Kalibrierung (claude -p)");
         Box::new(ClaudeCodeModel::new(Some("opus".to_string())))
     } else {
-        Box::new(OllamaClient::new(
-            profile.llm.ollama_url.clone(),
-            profile.llm.synth_model.clone(),
-        ))
+        Box::new(local_judge(profile))
     };
 
     if enrich_mode {
@@ -720,13 +719,21 @@ async fn run_config(profile: &ProfileFile, rest: &[String]) -> Result<()> {
     }
 }
 
+/// Lokales Judge-Modell: `judge_model` aus dem Profil, Fallback synth_model (§T2.4).
+fn local_judge(profile: &ProfileFile) -> OllamaClient {
+    let model = if profile.llm.judge_model.is_empty() {
+        &profile.llm.synth_model
+    } else {
+        &profile.llm.judge_model
+    };
+    OllamaClient::new(profile.llm.ollama_url.clone(), model.clone())
+}
+
 async fn run_optimize(profile: &ProfileFile, rest: &[String]) -> Result<()> {
     let calibrate = rest.iter().any(|a| a == "calibrate");
-    let date = rest
-        .iter()
-        .find(|a| a.as_str() != "calibrate")
-        .cloned()
-        .unwrap_or_else(today);
+    // Optionales Datum: beschränkt den Schatten-Test auf diesen Tag; ohne Datum laufen
+    // die jüngsten Briefing-Tage (Multi-Tag-Urteil, §T2.4).
+    let date = rest.iter().find(|a| a.as_str() != "calibrate").cloned();
 
     let store = Store::open(&profile.store.path).await?;
     let synth = OllamaClient::new(
@@ -746,15 +753,17 @@ async fn run_optimize(profile: &ProfileFile, rest: &[String]) -> Result<()> {
     let judge: Box<dyn LanguageModel> = if calibrate {
         Box::new(ClaudeCodeModel::new(Some("opus".to_string())))
     } else {
-        Box::new(OllamaClient::new(
-            profile.llm.ollama_url.clone(),
-            profile.llm.synth_model.clone(),
-        ))
+        Box::new(local_judge(profile))
     };
 
-    let outcome =
-        ibrief_optimize::optimize_tldr(&store, optimizer.as_ref(), &synth, judge.as_ref(), &date)
-            .await?;
+    let outcome = ibrief_optimize::optimize_tldr(
+        &store,
+        optimizer.as_ref(),
+        &synth,
+        judge.as_ref(),
+        date.as_deref(),
+    )
+    .await?;
 
     if outcome.adopted {
         println!(
