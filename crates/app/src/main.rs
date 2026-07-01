@@ -26,7 +26,7 @@
 //! Voraussetzungen: Ollama (brief/eval), IBRIEF_TELEGRAM_TOKEN (feedback/push).
 
 use anyhow::{Context, Result};
-use ibrief_core::{BriefingSection, FeedbackKind};
+use ibrief_core::FeedbackKind;
 use ibrief_eval::{EvalWeights, RUBRIC_VERSION, bakeoff::Candidate};
 use ibrief_ingest::Source;
 use ibrief_llm::{ClaudeCodeModel, LanguageModel, OllamaClient};
@@ -196,82 +196,41 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
         return Ok(());
     }
 
-    // SCORE zuerst, dann nur die Kandidaten anreichern, die auch kuratiert werden.
-    // (Sonst werden die ersten N in Fetch-Reihenfolge enriched, aber die aktuellsten gezeigt.)
     let cfg = ibrief_learn::load_active(&store).await?;
     // Alle geholten Items merken, um NICHT gezeigte erst NACH dem durablen save_briefing als
     // „gesehen" zu markieren (Crash-Resumability §T1.2 — vorher wird nichts markiert).
     let all_fetched = fresh.clone();
-    let pre_ranked = ibrief_pipeline::rank(fresh, &cfg);
-    let candidate_n = profile.llm.max_items_enrich.max(profile.llm.top_n);
-    let candidates: Vec<_> = pre_ranked.into_iter().take(candidate_n).collect();
 
-    // ENRICH (Massen-Tier) nur über die Kandidaten + Persist (jetzt mit Summary/Topics)
     let enrich_model = OllamaClient::new(
         profile.llm.ollama_url.clone(),
         profile.llm.enrich_model.clone(),
     );
-    let n_cand = candidates.len();
-    tracing::info!(model = enrich_model.label(), candidates = n_cand, "ENRICH");
-    let enriched = ibrief_pipeline::enrich(candidates, &enrich_model, n_cand).await;
-    // Persistenz erst mit save_briefing: angereicherte, gezeigte Items werden dort atomar
-    // mitgeschrieben; nicht gezeigte werden nach dem Speichern als „gesehen" markiert.
-
-    // RE-RANK (jetzt mit Topics) → Wildcard + quellen-diverse Kuration
-    let ranked = ibrief_pipeline::rank(enriched, &cfg);
-    let wildcard = ibrief_pipeline::pick_wildcard(&ranked, profile.llm.top_n);
-    let max_per_source = ((profile.llm.top_n as f64) * MAX_SOURCE_SHARE)
-        .floor()
-        .max(1.0) as usize;
-    let mut briefing = ibrief_pipeline::curate(ranked, profile.llm.top_n, max_per_source);
-    briefing.date = today();
-
-    // SYNTHESE (Synthese-Tier): TL;DR und Gegenperspektive sind voneinander unabhängig
-    // (die Gegenperspektive liest das TL;DR nicht) → nebenläufig anstoßen. Der Wall-Clock-
-    // Gewinn hängt von OLLAMA_NUM_PARALLEL ab; bei num_parallel=1 serialisiert Ollama beide,
-    // dann bleibt es korrekt, nur ohne Overlap.
     let synth_model = OllamaClient::new(
         profile.llm.ollama_url.clone(),
         profile.llm.synth_model.clone(),
     );
     let tldr_prompt = ibrief_optimize::active_tldr(&store).await?;
-    tracing::info!(
-        model = synth_model.label(),
-        prompt = %tldr_prompt.version,
-        "SYNTHESE (TL;DR + Gegenperspektive, nebenläufig)"
-    );
-    let t_synth = Instant::now();
-    let (tldr_res, cp_res) = tokio::join!(
-        ibrief_pipeline::make_tldr(&briefing, &synth_model, &tldr_prompt.template),
-        ibrief_pipeline::make_counterpoint(&briefing, &synth_model, &briefing.date),
-    );
-    match tldr_res {
-        Ok(tldr) => briefing.tldr = tldr,
-        Err(e) => tracing::warn!(error = %e, "TL;DR-Erzeugung fehlgeschlagen, fahre ohne fort"),
-    }
-    match cp_res {
-        // Persistenz erst mit save_briefing (Counterpoint ist Teil von briefing.sections).
-        Ok(Some(cp)) => briefing.sections.push(BriefingSection {
-            id: "counterpoint".into(),
-            title: "Gegenperspektive".into(),
-            items: vec![cp],
-        }),
-        Ok(None) => tracing::warn!("Gegenperspektive leer — übersprungen"),
-        Err(e) => tracing::warn!(error = %e, "Gegenperspektive fehlgeschlagen"),
-    }
-    tracing::info!(
-        elapsed_ms = t_synth.elapsed().as_millis() as u64,
-        "SYNTHESE fertig"
-    );
+    tracing::info!(prompt = %tldr_prompt.version, "aktiver TL;DR-Prompt");
 
-    // WILDCARD (§3, nicht abschaltbar — bewusste Überraschung)
-    if let Some(w) = wildcard {
-        briefing.sections.push(BriefingSection {
-            id: "wildcard".into(),
-            title: "Wildcard — über den Tellerrand".into(),
-            items: vec![w],
-        });
-    }
+    let opts = ibrief_pipeline::AssembleOpts {
+        max_items_enrich: profile.llm.max_items_enrich,
+        top_n: profile.llm.top_n,
+        max_per_source: ((profile.llm.top_n as f64) * MAX_SOURCE_SHARE)
+            .floor()
+            .max(1.0) as usize,
+    };
+    // Kern-Pipeline (SCORE→ENRICH→RE-RANK→CURATE→SYNTHESE→WILDCARD) — testbarer Seam,
+    // ohne Persistenz/Ingest. Modelle werden injiziert.
+    let briefing = ibrief_pipeline::assemble_briefing(
+        fresh,
+        &cfg,
+        &enrich_model,
+        &synth_model,
+        &tldr_prompt.template,
+        today(),
+        &opts,
+    )
+    .await;
 
     // PERSIST Briefing-Record
     let config_version = store

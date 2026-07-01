@@ -337,6 +337,82 @@ pub fn render(briefing: &Briefing) -> String {
     md
 }
 
+/// Lauf-Parameter für [`assemble_briefing`] (aus dem Profil injiziert).
+pub struct AssembleOpts {
+    pub max_items_enrich: usize,
+    pub top_n: usize,
+    pub max_per_source: usize,
+}
+
+/// Baut aus geholten Items ein fertiges Briefing:
+/// SCORE → ENRICH(Top-Kandidaten) → RE-RANK → CURATE → SYNTHESE(TL;DR ∥ Gegenperspektive)
+/// → WILDCARD. Die reine, testbare Kern-Pipeline OHNE Ingest/Persistenz — die Modelle werden
+/// injiziert (`&dyn LanguageModel`), sodass der Pfad mit einem Fake-Modell end-to-end
+/// getestet werden kann (§T1.6). Persistenz und „gesehen"-Markierung bleiben beim Aufrufer.
+pub async fn assemble_briefing(
+    fetched: Vec<ContentItem>,
+    cfg: &Config,
+    enrich_model: &dyn LanguageModel,
+    synth_model: &dyn LanguageModel,
+    tldr_template: &str,
+    date: String,
+    opts: &AssembleOpts,
+) -> Briefing {
+    // SCORE zuerst, dann nur die Kandidaten anreichern, die auch kuratiert werden.
+    let pre_ranked = rank(fetched, cfg);
+    let candidate_n = opts.max_items_enrich.max(opts.top_n);
+    let candidates: Vec<_> = pre_ranked.into_iter().take(candidate_n).collect();
+    let n_cand = candidates.len();
+    tracing::info!(model = enrich_model.label(), candidates = n_cand, "ENRICH");
+    let enriched = enrich(candidates, enrich_model, n_cand).await;
+
+    // RE-RANK (jetzt mit Topics) → Wildcard + quellen-diverse Kuration.
+    let ranked = rank(enriched, cfg);
+    let wildcard = pick_wildcard(&ranked, opts.top_n);
+    let mut briefing = curate(ranked, opts.top_n, opts.max_per_source);
+    briefing.date = date;
+
+    // SYNTHESE: TL;DR und Gegenperspektive sind unabhängig (Counterpoint liest das TL;DR
+    // nicht) → nebenläufig. Wall-Clock-Gewinn abhängig von OLLAMA_NUM_PARALLEL.
+    tracing::info!(
+        model = synth_model.label(),
+        "SYNTHESE (TL;DR + Gegenperspektive, nebenläufig)"
+    );
+    let t_synth = std::time::Instant::now();
+    let (tldr_res, cp_res) = tokio::join!(
+        make_tldr(&briefing, synth_model, tldr_template),
+        make_counterpoint(&briefing, synth_model, &briefing.date),
+    );
+    match tldr_res {
+        Ok(tldr) => briefing.tldr = tldr,
+        Err(e) => tracing::warn!(error = %e, "TL;DR-Erzeugung fehlgeschlagen, fahre ohne fort"),
+    }
+    match cp_res {
+        Ok(Some(cp)) => briefing.sections.push(BriefingSection {
+            id: "counterpoint".into(),
+            title: "Gegenperspektive".into(),
+            items: vec![cp],
+        }),
+        Ok(None) => tracing::warn!("Gegenperspektive leer — übersprungen"),
+        Err(e) => tracing::warn!(error = %e, "Gegenperspektive fehlgeschlagen"),
+    }
+    tracing::info!(
+        elapsed_ms = t_synth.elapsed().as_millis() as u64,
+        "SYNTHESE fertig"
+    );
+
+    // WILDCARD (§3, nicht abschaltbar — bewusste Überraschung).
+    if let Some(w) = wildcard {
+        briefing.sections.push(BriefingSection {
+            id: "wildcard".into(),
+            title: "Wildcard — über den Tellerrand".into(),
+            items: vec![w],
+        });
+    }
+
+    briefing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +641,69 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn assemble_briefing_end_to_end() {
+            // 6 Items aus 2 Quellen; deckt Enrich, Re-Rank, Kuration, Synthese und Wildcard ab.
+            let items: Vec<ContentItem> = (0..6)
+                .map(|i| {
+                    let src = if i < 3 { "verge" } else { "hn" };
+                    ContentItem {
+                        id: format!("item-{i}"),
+                        source_id: src.into(),
+                        title: format!("Artikel {i}"),
+                        url: format!("https://{src}.com/{i}"),
+                        published_at: None,
+                        raw_summary: Some(format!("Roh-Text {i}.")),
+                        summary: None,
+                        topics: vec![],
+                        entities: vec![],
+                        embedding: None,
+                    }
+                })
+                .collect();
+
+            let enrich_responses: Vec<String> = (0..6)
+                .map(|i| format!(r#"{{"summary":"Zusammenfassung {i}.","topics":["t{i}"]}}"#))
+                .collect();
+            let enrich_model = ScriptedModel::new("enrich", enrich_responses);
+
+            // Synth wird über tokio::join! ZWEIMAL aufgerufen (TL;DR + Gegenperspektive), die
+            // Reihenfolge ist nicht garantiert → zwei identische Antworten. Der Bullet-Text ist
+            // zugleich ein gültiges TL;DR (3 Bullets) und ein nicht-leerer Counterpoint.
+            let bullets = "- Erste Sache\n- Zweite Sache\n- Dritte Sache".to_string();
+            let synth_model = ScriptedModel::new("synth", vec![bullets.clone(), bullets]);
+
+            let cfg = Config::default();
+            let opts = AssembleOpts {
+                max_items_enrich: 6,
+                top_n: 4,
+                max_per_source: 3,
+            };
+            let briefing = assemble_briefing(
+                items,
+                &cfg,
+                &enrich_model,
+                &synth_model,
+                "Fasse zusammen:\n{items}",
+                "2026-07-01".into(),
+                &opts,
+            )
+            .await;
+
+            assert_eq!(briefing.date, "2026-07-01");
+            assert_eq!(briefing.tldr.len(), 3, "TL;DR hat 3 Bullets");
+
+            // Hauptsektion vorhanden + kuratiert (≤ top_n), alle mit Summary.
+            let main = &briefing.sections[0];
+            assert_eq!(main.id, "ai_tech");
+            assert!(main.items.len() <= 4 && !main.items.is_empty());
+            assert!(main.items.iter().all(|it| it.summary.is_some()));
+
+            // Anti-Blase-Sektionen: Gegenperspektive + Wildcard (6 Items > top_n=4 → Wildcard da).
+            assert!(briefing.sections.iter().any(|s| s.id == "counterpoint"));
+            assert!(briefing.sections.iter().any(|s| s.id == "wildcard"));
         }
 
         #[tokio::test]
