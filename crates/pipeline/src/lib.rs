@@ -12,6 +12,12 @@ use std::collections::{HashMap, HashSet};
 const ENRICH_SYSTEM: &str =
     "Du bist ein präziser Redaktions-Assistent. Antworte ausschließlich mit JSON.";
 
+/// Enrich liefert nur einen Satz + max. 3 Tags — Obergrenze gegen ausuferndes Generieren
+/// (großzügig, damit das JSON nie mitten im Objekt abgeschnitten wird und unparsebar wird).
+const ENRICH_MAX_TOKENS: u32 = 200;
+/// Synthese (TL;DR: 3 Bullets · Gegenperspektive: 2-3 Sätze) — deckelt den Generierungs-Schwanz.
+const SYNTH_MAX_TOKENS: u32 = 400;
+
 const COUNTERPOINT_SYSTEM: &str =
     "Du bist ein fairer, intellektuell ehrlicher Sparringspartner — kein Provokateur.";
 
@@ -35,6 +41,7 @@ pub async fn enrich(
     max: usize,
 ) -> Vec<ContentItem> {
     let n = max.min(items.len());
+    let started = std::time::Instant::now();
     const CONCURRENCY: usize = 4;
     for chunk_start in (0..n).step_by(CONCURRENCY) {
         let chunk_end = (chunk_start + CONCURRENCY).min(n);
@@ -54,6 +61,18 @@ pub async fn enrich(
             }
         }
     }
+    let ok = items
+        .iter()
+        .take(n)
+        .filter(|it| it.summary.is_some())
+        .count();
+    tracing::info!(
+        items = n,
+        ok,
+        failed = n - ok,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "ENRICH abgeschlossen"
+    );
     items
 }
 
@@ -66,8 +85,15 @@ async fn enrich_one(item: &ContentItem, model: &dyn LanguageModel) -> Result<Enr
     );
     let req = Completion::new(prompt)
         .with_system(ENRICH_SYSTEM)
-        .temperature(0.3);
+        .temperature(0.3)
+        .max_tokens(ENRICH_MAX_TOKENS);
+    let t0 = std::time::Instant::now();
     let raw = model.complete(&req).await?;
+    tracing::debug!(
+        title = %item.title,
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "enrich_one"
+    );
     let json = extract_json(&raw);
     Ok(serde_json::from_str(&json)?)
 }
@@ -181,7 +207,11 @@ pub async fn make_tldr(
         format!("{template}\n\n{lines}")
     };
     let raw = model
-        .complete(&Completion::new(prompt).temperature(0.4))
+        .complete(
+            &Completion::new(prompt)
+                .temperature(0.4)
+                .max_tokens(SYNTH_MAX_TOKENS),
+        )
         .await?;
 
     let bullets = raw
@@ -218,7 +248,8 @@ pub async fn make_counterpoint(
         .complete(
             &Completion::new(prompt)
                 .with_system(COUNTERPOINT_SYSTEM)
-                .temperature(0.6),
+                .temperature(0.6)
+                .max_tokens(SYNTH_MAX_TOKENS),
         )
         .await?
         .trim()

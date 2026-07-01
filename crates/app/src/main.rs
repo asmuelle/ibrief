@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const TOKEN_ENV: &str = "IBRIEF_TELEGRAM_TOKEN";
 const CONFIG_DIR_ENV: &str = "IBRIEF_CONFIG_DIR";
@@ -95,8 +95,13 @@ struct SourcesFile {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default INFO; per RUST_LOG feiner steuerbar (z.B. `RUST_LOG=ibrief_pipeline=debug` zeigt
+    // die Enrich-Zeit pro Item — Grundlage der Latenz-Diagnose).
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let mut args = std::env::args().skip(1);
@@ -143,6 +148,7 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
 
     // INGEST + DEDUP (Intra-Batch gegen Feed-Doppel, dann Cross-Day gegen den Store)
     tracing::info!(sources = sources.len(), "INGEST");
+    let t_ingest = Instant::now();
     let fetched = ibrief_ingest::fetch_all(&sources).await;
     let deduped = ibrief_pipeline::dedup_batch(fetched);
     let fresh = if force {
@@ -173,7 +179,11 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
         fresh
     };
 
-    tracing::info!(fresh = fresh.len(), "Items nach Dedup/Filter");
+    tracing::info!(
+        fresh = fresh.len(),
+        elapsed_ms = t_ingest.elapsed().as_millis() as u64,
+        "INGEST fertig (nach Dedup/Filter)"
+    );
     if fresh.is_empty() {
         tracing::warn!(
             "keine neuen Items — nichts zu briefen (Tipp: `brief --force` baut heute neu)"
@@ -222,12 +232,19 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
     );
     let tldr_prompt = ibrief_optimize::active_tldr(&store).await?;
     tracing::info!(model = synth_model.label(), prompt = %tldr_prompt.version, "TL;DR");
+    // Erste Synth-Anfrage im Lauf: enthält ggf. das (einmalige) Laden des Synth-Modells.
+    let t_tldr = Instant::now();
     match ibrief_pipeline::make_tldr(&briefing, &synth_model, &tldr_prompt.template).await {
         Ok(tldr) => briefing.tldr = tldr,
         Err(e) => tracing::warn!(error = %e, "TL;DR-Erzeugung fehlgeschlagen, fahre ohne fort"),
     }
+    tracing::info!(
+        elapsed_ms = t_tldr.elapsed().as_millis() as u64,
+        "TL;DR fertig"
+    );
 
     // GEGENPERSPEKTIVE (§3, nicht abschaltbar — Anti-Blase)
+    let t_cp = Instant::now();
     match ibrief_pipeline::make_counterpoint(&briefing, &synth_model, &briefing.date).await {
         Ok(Some(cp)) => {
             store.upsert_item(&cp).await?; // persistieren, damit load_briefing es findet
@@ -240,6 +257,10 @@ async fn run_brief(cfg_dir: &Path, profile: &ProfileFile, rest: &[String]) -> Re
         Ok(None) => tracing::warn!("Gegenperspektive leer — übersprungen"),
         Err(e) => tracing::warn!(error = %e, "Gegenperspektive fehlgeschlagen"),
     }
+    tracing::info!(
+        elapsed_ms = t_cp.elapsed().as_millis() as u64,
+        "Gegenperspektive fertig"
+    );
 
     // WILDCARD (§3, nicht abschaltbar — bewusste Überraschung)
     if let Some(w) = wildcard {

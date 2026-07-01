@@ -16,6 +16,9 @@ pub struct Completion {
     pub system: Option<String>,
     pub prompt: String,
     pub temperature: f32,
+    /// Obergrenze der zu generierenden Tokens (Ollama: `num_predict`). `None` = Modell-Default.
+    /// Deckelt ausuferndes Generieren — der größte Einzel-Hebel gegen die Enrich-Latenz.
+    pub max_tokens: Option<u32>,
 }
 
 impl Completion {
@@ -24,6 +27,7 @@ impl Completion {
             system: None,
             prompt: prompt.into(),
             temperature: 0.4,
+            max_tokens: None,
         }
     }
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -32,6 +36,11 @@ impl Completion {
     }
     pub fn temperature(mut self, t: f32) -> Self {
         self.temperature = t;
+        self
+    }
+    /// Setzt die Token-Obergrenze der Antwort (Ollama: `num_predict`).
+    pub fn max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = Some(n);
         self
     }
 }
@@ -47,22 +56,55 @@ pub trait LanguageModel: Send + Sync {
 // Ollama (lokal)
 // ---------------------------------------------------------------------------
 
+/// Wie lange Ollama das Modell nach einer Anfrage geladen hält. Vermeidet teures Neuladen
+/// (~15-20 GB) zwischen Enrich-/Synth-Stage und über Prozessgrenzen (`brief`→`eval`→`learn`).
+const DEFAULT_KEEP_ALIVE: &str = "30m";
+/// Kontextfenster-Obergrenze. Verhindert, dass Ollama das (u.U. riesige) Modell-Maximum
+/// vorhält; großzügig genug für Briefing-Prompts.
+const DEFAULT_NUM_CTX: u32 = 8192;
+/// Gesamt-Timeout je Anfrage. Bounded gegen hängende Inferenz im nächtlichen Batch
+/// (sonst blockiert ein einziger Hänger den ganzen Lauf), aber großzügig für große Modelle.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Timeout für den reinen Verbindungsaufbau (Ollama nicht erreichbar → schnell scheitern).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct OllamaClient {
     base_url: String,
     model: String,
     label: String,
+    keep_alive: String,
+    num_ctx: u32,
     http: reqwest::Client,
 }
 
 impl OllamaClient {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         let model = model.into();
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .build()
+            .expect("reqwest-Client bauen (nur TLS-Init kann scheitern)");
         Self {
             base_url: base_url.into(),
             label: format!("ollama:{model}"),
             model,
-            http: reqwest::Client::new(),
+            keep_alive: DEFAULT_KEEP_ALIVE.to_string(),
+            num_ctx: DEFAULT_NUM_CTX,
+            http,
         }
+    }
+
+    /// Überschreibt, wie lange Ollama das Modell geladen hält (z.B. "60m", "0" = sofort entladen).
+    pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
+        self.keep_alive = keep_alive.into();
+        self
+    }
+
+    /// Überschreibt die Kontextfenster-Obergrenze (`num_ctx`).
+    pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
+        self.num_ctx = num_ctx;
+        self
     }
 }
 
@@ -71,6 +113,7 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
+    keep_alive: &'a str,
     options: ChatOptions,
 }
 
@@ -83,6 +126,9 @@ struct ChatMessage<'a> {
 #[derive(Serialize)]
 struct ChatOptions {
     temperature: f32,
+    num_ctx: u32,
+    /// Max. zu generierende Tokens; `-1` = unbegrenzt (Ollama-Default), sonst die Deckelung.
+    num_predict: i32,
 }
 
 #[derive(Deserialize)]
@@ -114,8 +160,12 @@ impl LanguageModel for OllamaClient {
             model: self.model.as_str(),
             messages,
             stream: false,
+            keep_alive: self.keep_alive.as_str(),
             options: ChatOptions {
                 temperature: req.temperature,
+                num_ctx: self.num_ctx,
+                // None → -1 (Ollama-Default: unbegrenzt), erhält das bisherige Verhalten.
+                num_predict: req.max_tokens.map(|n| n as i32).unwrap_or(-1),
             },
         };
 

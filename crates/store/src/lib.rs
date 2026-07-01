@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use ibrief_core::{Briefing, BriefingSection, ContentItem, FeedbackKind};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 /// Aggregierte Feedback-Zählung für ein Briefing (Eingabe für den Verhaltens-Score, §6.2).
@@ -215,9 +215,14 @@ pub struct Store {
 impl Store {
     /// Öffnet (oder erstellt) die DB und legt das Schema an.
     pub async fn open(path: &str) -> Result<Self> {
+        // WAL: erlaubt gleichzeitige Leser während eines Schreibers und macht Commits
+        // haltbarer bei einem Absturz mitten im nächtlichen Lauf. busy_timeout: wartet auf
+        // eine gehaltene Sperre statt sofort mit SQLITE_BUSY zu scheitern (Pool hat 4 Verbindungen).
         let opts = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(opts)
@@ -300,6 +305,12 @@ impl Store {
     /// Speichert einen Briefing-Record samt gezeigter Items (globale Position für Button-Mapping).
     pub async fn save_briefing(&self, b: &Briefing, config_version: &str) -> Result<()> {
         let tldr = serde_json::to_string(&b.tldr)?;
+
+        // Atomar: Header, das Löschen alter Item-Zuordnungen und die neuen Items gehören in
+        // eine Transaktion. Ein Absturz mitten im ~30-min-Lauf darf keinen Header ohne (oder mit
+        // halben) Items hinterlassen, den Eval/Learn danach als echtes Briefing konsumieren.
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             "INSERT OR REPLACE INTO briefings (date, config_version, tldr, created_at)
              VALUES (?, ?, ?, ?)",
@@ -308,14 +319,14 @@ impl Store {
         .bind(config_version)
         .bind(tldr)
         .bind(now())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         // Alte Item-Zuordnungen des Tages entfernen, damit ein Neuaufbau (z.B. `brief --force`)
         // nicht doppelte/mehrdeutige Positionen hinterlässt.
         sqlx::query("DELETE FROM briefing_items WHERE briefing_date = ?")
             .bind(b.date.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         let mut position: i64 = 0;
@@ -330,11 +341,13 @@ impl Store {
                 .bind(it.id.as_str())
                 .bind(sec.id.as_str())
                 .bind(position)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
                 position += 1;
             }
         }
+
+        tx.commit().await?;
         Ok(())
     }
 

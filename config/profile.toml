@@ -20,8 +20,12 @@ min_source_quality = 0.3
 # Das aktive synth_model ist immer als Baseline dabei. Leer lassen = nur Baseline.
 # Tags vor dem Lauf verifizieren: `ollama pull <tag>` / `ollama list`.
 synth_candidates = [ "gemma4:31b"]
-# Kandidaten für den Massen-/Enrich-Tier (Doku + spätere Enrich-Bakeoffs).
-enrich_candidates = ["gemma4:26b", "qwen3:30b-a3b"]
+# Kandidaten für den Massen-/Enrich-Tier — mit `ibrief bench enrich` fair gegen das aktive
+# Modell messen, bevor `enrich_model` umgestellt wird (das dichte 26B ist für Ein-Satz-
+# Zusammenfassungen überdimensioniert). gemma4:12b ist bereits installiert (kleineres dichtes
+# Modell → schneller). qwen3:30b-a3b (MoE, ~3B aktiv/Token) ist das eigentliche Ziel, muss aber
+# erst geladen werden: `ollama pull qwen3:30b-a3b` (sonst 404 im Lauf).
+enrich_candidates = ["gemma4:26b", "gemma4:12b", "qwen3:30b-a3b"]
 
 [store]
 path = "ibrief.db"
