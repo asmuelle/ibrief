@@ -237,6 +237,113 @@ pub async fn rollback(store: &Store, version: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mindest-Eval-Tage je Arm, bevor der äußere Loop urteilt (§T2.6).
+pub const OUTER_MIN_SAMPLES: usize = 3;
+/// Geforderter Mindestabstand der Eval-Mittelwerte für Demotion/Bestätigung.
+pub const OUTER_MARGIN: f64 = 0.05;
+/// Wie viele jüngste Eval-Noten je Config in den Vergleich eingehen.
+const OUTER_EVAL_WINDOW: i64 = 30;
+
+/// Ergebnis des äußeren Eval-Loops.
+#[derive(Debug, Clone)]
+pub struct OuterLoopOutcome {
+    pub decision: AbDecision,
+    pub active: String,
+    pub parent: Option<String>,
+    /// True, wenn die aktive Config demotet und der Parent reaktiviert wurde.
+    pub rolled_back: bool,
+    pub note: String,
+}
+
+/// Äußerer A/B-Loop (§6.5/§T2.6): vergleicht die **täglichen Eval-Noten** der aktiven
+/// Config mit denen ihres Parents ([`ab_decision`]). Das ist die langsame Verschärfung des
+/// schnellen Präferenz-Gates in [`learn_once`]: eine Config, die das Gate passierte, aber
+/// über Tage messbar schlechter briefed als ihr Vorgänger, wird demotet (Rollback auf den
+/// Parent, als Experiment protokolliert). `Promote` bestätigt nur; `KeepRunning` sammelt.
+pub async fn outer_loop_check(store: &Store) -> Result<OuterLoopOutcome> {
+    let keep = |active: String, parent: Option<String>, note: String| OuterLoopOutcome {
+        decision: AbDecision::KeepRunning,
+        active,
+        parent,
+        rolled_back: false,
+        note,
+    };
+
+    let Some(active) = store.active_config_version().await? else {
+        return Ok(keep(
+            "default".into(),
+            None,
+            "keine gelernte Config aktiv — nichts zu prüfen".into(),
+        ));
+    };
+    let Some(parent) = store.config_parent(&active).await? else {
+        return Ok(keep(
+            active,
+            None,
+            "aktive Config ist Wurzel (kein Parent) — kein Vergleichsarm".into(),
+        ));
+    };
+
+    let active_evals = store.evals_for_config(&active, OUTER_EVAL_WINDOW).await?;
+    let parent_evals = store.evals_for_config(&parent, OUTER_EVAL_WINDOW).await?;
+    let decision = ab_decision(
+        &parent_evals,
+        &active_evals,
+        OUTER_MIN_SAMPLES,
+        OUTER_MARGIN,
+    );
+
+    let (rolled_back, note) = match decision {
+        AbDecision::Reject => {
+            // Demotion: Parent reaktivieren + als Experiment protokollieren.
+            rollback(store, &parent).await?;
+            store
+                .save_experiment(&ibrief_store::ExperimentRow {
+                    id: format!("outer-{active}-n{}", active_evals.len()),
+                    kind: "config".into(),
+                    slot: "weights".into(),
+                    control: parent.clone(),
+                    candidate: active.clone(),
+                    status: "demoted".into(),
+                    created_at: String::new(), // vom Store gesetzt
+                })
+                .await?;
+            (
+                true,
+                format!(
+                    "Demotion: {active} evaluiert über {} Tage schlechter als Parent {parent} \
+(Marge {OUTER_MARGIN}) — Rollback",
+                    active_evals.len()
+                ),
+            )
+        }
+        AbDecision::Promote => (
+            false,
+            format!(
+                "aktive Config {active} über {} Tage besser als Parent — bestätigt",
+                active_evals.len()
+            ),
+        ),
+        AbDecision::KeepRunning => (
+            false,
+            format!(
+                "zu wenig Evidenz (aktiv {} / Parent {} Eval-Tage, min {OUTER_MIN_SAMPLES}) — \
+weiter beobachten",
+                active_evals.len(),
+                parent_evals.len()
+            ),
+        ),
+    };
+
+    Ok(OuterLoopOutcome {
+        decision,
+        active,
+        parent: Some(parent),
+        rolled_back,
+        note,
+    })
+}
+
 /// Aggregiert Feedback je Quelle und je Thema zu Beta-Evidenz — zeitverfallen (§T2.5):
 /// die Evidenz eines Ereignisses schrumpft mit 0.5^(Alter/[`FEEDBACK_HALF_LIFE_DAYS`]).
 pub fn aggregate(
@@ -563,6 +670,95 @@ mod tests {
             topic_weights: BTreeMap::new(),
         };
         assert!(gate(&c).passed);
+    }
+
+    async fn temp_store(tag: &str) -> (Store, String) {
+        let path = std::env::temp_dir()
+            .join(format!("ibrief-learn-{tag}-{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        (Store::open(&path).await.unwrap(), path)
+    }
+
+    async fn seed_eval(store: &Store, date: &str, version: &str, total: f64) {
+        store
+            .save_eval(&ibrief_store::EvalRow {
+                date: date.into(),
+                config_version: version.into(),
+                rubric_version: "r1".into(),
+                behavior: total,
+                judge: total,
+                structure: total,
+                total,
+                notes: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn outer_loop_demotes_config_that_evals_worse_than_parent() {
+        let (store, path) = temp_store("demote").await;
+        store
+            .save_config("cfg-parent", None, "seed", "{}")
+            .await
+            .unwrap();
+        store
+            .save_config("cfg-child", Some("cfg-parent"), "learn", "{}")
+            .await
+            .unwrap();
+        store.set_active_config("cfg-child").await.unwrap();
+
+        // 3 Eval-Tage je Arm: Parent klar besser als das aktive Kind.
+        for (i, (p, c)) in [(0.8, 0.5), (0.82, 0.48), (0.79, 0.52)].iter().enumerate() {
+            seed_eval(&store, &format!("2026-06-2{i}"), "cfg-parent", *p).await;
+            seed_eval(&store, &format!("2026-06-2{}", i + 5), "cfg-child", *c).await;
+        }
+
+        let out = outer_loop_check(&store).await.unwrap();
+        assert_eq!(out.decision, AbDecision::Reject);
+        assert!(out.rolled_back);
+        assert_eq!(
+            store.active_config_version().await.unwrap().as_deref(),
+            Some("cfg-parent"),
+            "Demotion muss den Parent reaktivieren"
+        );
+        // Demotion ist als Experiment protokolliert.
+        let exps = store.recent_experiments(5).await.unwrap();
+        assert!(
+            exps.iter()
+                .any(|e| e.kind == "config" && e.status == "demoted")
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn outer_loop_waits_without_enough_eval_days() {
+        let (store, path) = temp_store("wait").await;
+        store
+            .save_config("cfg-parent", None, "seed", "{}")
+            .await
+            .unwrap();
+        store
+            .save_config("cfg-child", Some("cfg-parent"), "learn", "{}")
+            .await
+            .unwrap();
+        store.set_active_config("cfg-child").await.unwrap();
+        seed_eval(&store, "2026-06-29", "cfg-parent", 0.8).await;
+        seed_eval(&store, "2026-06-30", "cfg-child", 0.5).await;
+
+        let out = outer_loop_check(&store).await.unwrap();
+        assert_eq!(out.decision, AbDecision::KeepRunning);
+        assert!(!out.rolled_back);
+        assert_eq!(
+            store.active_config_version().await.unwrap().as_deref(),
+            Some("cfg-child"),
+            "ohne genug Evidenz bleibt die aktive Config"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -550,6 +550,29 @@ impl Store {
         Ok(())
     }
 
+    /// Eval-Gesamtnoten einer Config-Version (neueste zuerst) — Futter für den äußeren
+    /// A/B-Loop (§T2.6): Demotion einer Config, die über Tage schlechter evaluiert als
+    /// ihr Parent.
+    pub async fn evals_for_config(&self, config_version: &str, limit: i64) -> Result<Vec<f64>> {
+        let rows = sqlx::query(
+            "SELECT total FROM evals WHERE config_version = ? ORDER BY date DESC LIMIT ?",
+        )
+        .bind(config_version)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<f64, _>("total")).collect())
+    }
+
+    /// Parent-Version einer Config (None = Wurzel oder unbekannte Version).
+    pub async fn config_parent(&self, version: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT parent FROM configs WHERE version = ?")
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("parent")))
+    }
+
     /// Alle Feedback-Ereignisse mit Quelle/Themen des betroffenen Items.
     pub async fn feedback_join_meta(&self) -> Result<Vec<FeedbackMeta>> {
         let rows = sqlx::query(

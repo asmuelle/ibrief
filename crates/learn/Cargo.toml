@@ -13,3 +13,6 @@ serde_json.workspace = true
 tracing.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

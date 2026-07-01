@@ -14,6 +14,8 @@
 //!                             `enrich`: Massen-Tier (Ein-Satz-Zusammenfassungen je Item).
 //!   ibrief bench list         Bakeoff-Historie anzeigen (Modell-Vergleiche über Tage)
 //!   ibrief learn              Gewichte lernen (Thompson + Safety Gate) → neue Config-Version
+//!   ibrief learn check        Äußerer Eval-Loop: aktive Config vs. Parent über Eval-Tage;
+//!                             Demotion (Rollback) bei anhaltender Verschlechterung
 //!   ibrief config list        Config-Historie anzeigen (aktive markiert)
 //!   ibrief config rollback <version>   Auf frühere Config-Version zurücksetzen
 //!   ibrief optimize [datum] [calibrate]  TL;DR-Prompt optimieren (Schatten-Test) → ggf. neue Version
@@ -124,7 +126,7 @@ async fn main() -> Result<()> {
         "feedback" => run_feedback(&profile, &rest).await,
         "eval" => run_eval(&profile, &rest).await,
         "bench" => run_bench(&profile, &rest).await,
-        "learn" => run_learn(&profile).await,
+        "learn" => run_learn(&profile, &rest).await,
         "config" => run_config(&profile, &rest).await,
         "optimize" => run_optimize(&profile, &rest).await,
         "experiment" => run_experiment(&profile, &rest).await,
@@ -653,7 +655,17 @@ fn baseline_marker(name: &str, baseline: &str) -> &'static str {
     if name == baseline { " (baseline)" } else { "" }
 }
 
-async fn run_learn(profile: &ProfileFile) -> Result<()> {
+async fn run_learn(profile: &ProfileFile, rest: &[String]) -> Result<()> {
+    // `learn check`: äußerer Eval-Loop (§T2.6) — demotet eine aktive Config, die über
+    // Tage schlechter evaluiert als ihr Parent. Läuft auch im `daily`-Orchestrator.
+    if rest.first().map(String::as_str) == Some("check") {
+        let store = Store::open(&profile.store.path).await?;
+        let out = ibrief_learn::outer_loop_check(&store).await?;
+        let marker = if out.rolled_back { "⏮" } else { "·" };
+        println!("{marker} äußerer Eval-Loop: {}", out.note);
+        return Ok(());
+    }
+
     let store = Store::open(&profile.store.path).await?;
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
